@@ -1,9 +1,10 @@
 mod cli;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use cli::Cli;
 use media_convert::codec::Codec;
@@ -12,12 +13,9 @@ use media_convert::{probe, scan};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    let single_file_mode = validate(&args)?;
 
-    if !args.source.is_dir() {
-        anyhow::bail!("source is not a directory: {}", args.source.display());
-    }
-
-    let videos = scan::find_videos(&args.source);
+    let videos = scan::find_videos(&args.source, !args.no_recurse);
     if videos.is_empty() {
         println!("no video files found under {}", args.source.display());
         return Ok(());
@@ -27,6 +25,15 @@ fn main() -> Result<()> {
         videos.len(),
         args.codec.label()
     );
+
+    let rel_root: PathBuf = if single_file_mode {
+        args.source
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    } else {
+        args.source.clone()
+    };
 
     let cfg = args.backend.config(args.codec);
     let preset_owned = args.preset.clone();
@@ -43,10 +50,14 @@ fn main() -> Result<()> {
 
     for (idx, input) in videos.iter().enumerate() {
         let rel = input
-            .strip_prefix(&args.source)
+            .strip_prefix(&rel_root)
             .unwrap_or(input)
             .to_path_buf();
-        let output = output_path(&args.output, &rel);
+        let output = if single_file_mode && output_is_filepath(&args.output) {
+            args.output.clone()
+        } else {
+            output_path(&args.output, &rel)
+        };
 
         let prefix = format!("[{}/{}]", idx + 1, videos.len());
 
@@ -130,8 +141,67 @@ fn decide(input: &Path, target: Codec, force: bool) -> Result<Decision> {
     }
 }
 
+fn validate(args: &Cli) -> Result<bool> {
+    require_on_path("ffmpeg")?;
+    require_on_path("ffprobe")?;
+
+    if let Some(q) = args.quality {
+        if q > 63 {
+            bail!("--quality must be 0-63 (got {q}); see backend docs for the meaningful range");
+        }
+    }
+
+    let single_file_mode = if args.source.is_file() {
+        if !scan::is_video(&args.source) {
+            bail!(
+                "source file is not a recognised video format: {}",
+                args.source.display()
+            );
+        }
+        true
+    } else if args.source.is_dir() {
+        false
+    } else {
+        bail!("source does not exist: {}", args.source.display());
+    };
+
+    if args.output.exists() && !args.output.is_dir() && !single_file_mode {
+        bail!(
+            "--output exists and is not a directory: {}",
+            args.output.display()
+        );
+    }
+
+    Ok(single_file_mode)
+}
+
+fn require_on_path(prog: &str) -> Result<()> {
+    Command::new(prog)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|_| ())
+        .with_context(|| format!("`{prog}` not found on PATH; install ffmpeg first"))
+}
+
 fn output_path(output_root: &Path, rel: &Path) -> PathBuf {
     let mut out = output_root.join(rel);
     out.set_extension("mkv");
     out
+}
+
+fn output_is_filepath(p: &Path) -> bool {
+    if p.is_dir() {
+        return false;
+    }
+    if p.is_file() {
+        return true;
+    }
+    if let Some(s) = p.to_str() {
+        if s.ends_with('/') || s.ends_with(std::path::MAIN_SEPARATOR) {
+            return false;
+        }
+    }
+    p.extension().is_some()
 }

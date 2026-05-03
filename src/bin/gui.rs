@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -79,6 +79,17 @@ struct EncodeWorker {
     current_child: Arc<Mutex<Option<Child>>>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Severity {
+    Warning,
+    Error,
+}
+
+struct Notification {
+    severity: Severity,
+    messages: Vec<String>,
+}
+
 struct App {
     source: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -87,6 +98,7 @@ struct App {
     quality: u8,
     preset: String,
     force: bool,
+    recurse: bool,
 
     files: Vec<FileEntry>,
 
@@ -94,7 +106,9 @@ struct App {
     encoder: Option<EncodeWorker>,
 
     log: Vec<String>,
+    notification: Option<Notification>,
     selected_only_encode: bool,
+    startup_checked: bool,
 }
 
 impl Default for App {
@@ -110,11 +124,14 @@ impl Default for App {
             quality: cfg.default_quality,
             preset: cfg.default_preset.unwrap_or("").to_string(),
             force: false,
+            recurse: true,
             files: Vec::new(),
             scanner: None,
             encoder: None,
             log: Vec::new(),
+            notification: None,
             selected_only_encode: true,
+            startup_checked: false,
         }
     }
 }
@@ -138,6 +155,71 @@ impl App {
         }
     }
 
+    fn notify(&mut self, severity: Severity, msg: impl Into<String>) {
+        let s = msg.into();
+        self.log(s.clone());
+        match &mut self.notification {
+            Some(n) => {
+                if severity == Severity::Error {
+                    n.severity = Severity::Error;
+                }
+                n.messages.push(s);
+            }
+            None => {
+                self.notification = Some(Notification {
+                    severity,
+                    messages: vec![s],
+                });
+            }
+        }
+    }
+
+    fn notify_error(&mut self, msg: impl Into<String>) {
+        self.notify(Severity::Error, msg);
+    }
+
+    fn notify_warning(&mut self, msg: impl Into<String>) {
+        self.notify(Severity::Warning, msg);
+    }
+
+    fn show_notification(&mut self, ctx: &egui::Context) {
+        let Some(notif) = &self.notification else {
+            return;
+        };
+        let (title, color) = match notif.severity {
+            Severity::Error => ("Error", egui::Color32::from_rgb(220, 80, 80)),
+            Severity::Warning => ("Warning", egui::Color32::from_rgb(220, 160, 60)),
+        };
+        let messages = notif.messages.clone();
+
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("notification_modal")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.set_max_width(640.0);
+            ui.colored_label(color, egui::RichText::new(title).heading().strong());
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    for (i, m) in messages.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(6.0);
+                        }
+                        ui.label(m);
+                    }
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.notification = None;
+        }
+    }
+
     fn pick_dir(&mut self, kind: &str) -> Option<PathBuf> {
         let start = match kind {
             "source" => self.source.clone(),
@@ -150,17 +232,40 @@ impl App {
         dlg.pick_folder()
     }
 
+    fn pick_source_file(&mut self) -> Option<PathBuf> {
+        let start = self
+            .source
+            .as_ref()
+            .and_then(|p| if p.is_file() { p.parent() } else { Some(p.as_path()) })
+            .map(Path::to_path_buf);
+        let mut dlg = rfd::FileDialog::new().add_filter(
+            "Video",
+            &["mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "m2ts"],
+        );
+        if let Some(p) = start {
+            dlg = dlg.set_directory(p);
+        }
+        dlg.pick_file()
+    }
+
     fn start_scan(&mut self) {
         let Some(source) = self.source.clone() else {
-            self.log("scan: pick a source directory first");
+            self.notify_error("Pick a source folder or file before scanning.");
             return;
         };
         let Some(output) = self.output.clone() else {
-            self.log("scan: pick an output directory first");
+            self.notify_error("Pick an output directory before scanning.");
             return;
         };
-        if !source.is_dir() {
-            self.log(format!("scan: source is not a directory: {}", source.display()));
+        if !source.is_dir() && !source.is_file() {
+            self.notify_error(format!("Source does not exist:\n{}", source.display()));
+            return;
+        }
+        if source.is_file() && !media_convert::scan::is_video(&source) {
+            self.notify_error(format!(
+                "Source file is not a recognised video format:\n{}",
+                source.display()
+            ));
             return;
         }
 
@@ -168,18 +273,24 @@ impl App {
 
         let codec = self.codec;
         let force = self.force;
+        let recurse = self.recurse;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = cancel.clone();
         let (tx, rx) = channel();
 
         thread::spawn(move || {
-            let videos = scan::find_videos(&source);
+            let videos = scan::find_videos(&source, recurse);
+            let rel_root: PathBuf = if source.is_file() {
+                source.parent().map(Path::to_path_buf).unwrap_or_default()
+            } else {
+                source.clone()
+            };
             for abs in videos.iter() {
                 if cancel_thread.load(Ordering::Relaxed) {
                     break;
                 }
                 let rel = abs
-                    .strip_prefix(&source)
+                    .strip_prefix(&rel_root)
                     .unwrap_or(abs.as_path())
                     .to_path_buf();
                 let mut out = output.join(&rel);
@@ -236,7 +347,7 @@ impl App {
 
     fn start_encode(&mut self) {
         if self.encoder.is_some() {
-            self.log("encode: already running");
+            self.notify_warning("Encode is already running.");
             return;
         }
         let jobs: Vec<(usize, FileEntry)> = self
@@ -249,7 +360,7 @@ impl App {
             .collect();
 
         if jobs.is_empty() {
-            self.log("encode: nothing to do (run Scan first, or no encodable files)");
+            self.notify_warning("Nothing to encode. Run Scan first, or there are no encodable files.");
             return;
         }
 
@@ -328,6 +439,7 @@ impl App {
     fn drain_workers(&mut self, ctx: &egui::Context) {
         let mut needs_repaint = false;
         let mut deferred_log: Vec<String> = Vec::new();
+        let mut deferred_warnings: Vec<String> = Vec::new();
         let mut clear_scanner = false;
         let mut clear_encoder = false;
 
@@ -339,7 +451,7 @@ impl App {
                         needs_repaint = true;
                     }
                     Ok(ScanMsg::Error(msg)) => {
-                        deferred_log.push(msg);
+                        deferred_warnings.push(msg);
                         needs_repaint = true;
                     }
                     Ok(ScanMsg::Done(n)) => {
@@ -384,7 +496,8 @@ impl App {
                                 }
                                 Err(msg) => {
                                     f.status = Status::Failed(msg.clone());
-                                    deferred_log.push(format!("FAIL: {rel_display} ({msg})"));
+                                    deferred_warnings
+                                        .push(format!("Encode failed: {rel_display}\n{msg}"));
                                 }
                             }
                         }
@@ -421,6 +534,9 @@ impl App {
         for line in deferred_log {
             self.log(line);
         }
+        for line in deferred_warnings {
+            self.notify_warning(line);
+        }
 
         if self.scanner.is_some() || self.encoder.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
@@ -428,6 +544,15 @@ impl App {
             ctx.request_repaint();
         }
     }
+}
+
+fn is_on_path(prog: &str) -> bool {
+    Command::new(prog)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn run_one(
@@ -495,20 +620,40 @@ fn run_one(
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.startup_checked {
+            self.startup_checked = true;
+            for prog in ["ffmpeg", "ffprobe"] {
+                if !is_on_path(prog) {
+                    self.notify_error(format!(
+                        "`{prog}` not found on PATH. Install ffmpeg before running encodes."
+                    ));
+                }
+            }
+        }
+
         self.drain_workers(ctx);
+        self.show_notification(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Source…").clicked() {
+                if ui.button("Source folder…").clicked() {
                     if let Some(p) = self.pick_dir("source") {
+                        self.source = Some(p);
+                    }
+                }
+                if ui.button("Source file…").clicked() {
+                    if let Some(p) = self.pick_source_file() {
                         self.source = Some(p);
                     }
                 }
                 ui.label(
                     self.source
                         .as_ref()
-                        .map(|p| p.display().to_string())
+                        .map(|p| {
+                            let kind = if p.is_file() { "file" } else { "folder" };
+                            format!("{} [{kind}]", p.display())
+                        })
                         .unwrap_or_else(|| "(none)".into()),
                 );
             });
@@ -560,6 +705,10 @@ impl eframe::App for App {
                 );
                 ui.separator();
                 ui.checkbox(&mut self.force, "Force re-encode");
+                if self.source.as_deref().is_some_and(Path::is_dir) {
+                    ui.separator();
+                    ui.checkbox(&mut self.recurse, "Recurse subdirectories");
+                }
             });
             ui.horizontal(|ui| {
                 let scanning = self.scanner.is_some();
