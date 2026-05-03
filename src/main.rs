@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 
 use cli::Cli;
 use media_convert::codec::Codec;
+use media_convert::container::Container;
 use media_convert::convert::{self, EncodeOptions};
 use media_convert::{probe, scan};
 
@@ -52,7 +53,7 @@ fn main() -> Result<()> {
         let output = if single_file_mode && output_is_filepath(&args.output) {
             args.output.clone()
         } else {
-            output_path(&args.output, &rel)
+            output_path(&args.output, &rel, args.container)
         };
 
         let prefix = format!("[{}/{}]", idx + 1, videos.len());
@@ -107,6 +108,7 @@ fn main() -> Result<()> {
         let opts = EncodeOptions {
             codec: args.codec,
             backend: args.backend,
+            container: args.container,
             quality,
             preset,
             subtitles: &subtitles,
@@ -210,9 +212,9 @@ fn require_on_path(prog: &str) -> Result<()> {
         .with_context(|| format!("`{prog}` not found on PATH; install ffmpeg first"))
 }
 
-fn output_path(output_root: &Path, rel: &Path) -> PathBuf {
+fn output_path(output_root: &Path, rel: &Path, container: Container) -> PathBuf {
     let mut out = output_root.join(rel);
-    out.set_extension("mkv");
+    out.set_extension(container.extension());
     out
 }
 
@@ -269,8 +271,22 @@ mod tests {
     }
 
     #[test]
-    fn output_path_changes_extension_to_mkv() {
-        let out = output_path(Path::new("/out"), Path::new("show/episode.mp4"));
+    fn output_path_uses_mkv_extension_for_mkv_container() {
+        let out = output_path(
+            Path::new("/out"),
+            Path::new("show/episode.mp4"),
+            Container::Mkv,
+        );
         assert_eq!(out, PathBuf::from("/out/show/episode.mkv"));
+    }
+
+    #[test]
+    fn output_path_uses_mp4_extension_for_mp4_container() {
+        let out = output_path(
+            Path::new("/out"),
+            Path::new("show/episode.mkv"),
+            Container::Mp4,
+        );
+        assert_eq!(out, PathBuf::from("/out/show/episode.mp4"));
     }
 }

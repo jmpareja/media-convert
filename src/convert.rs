@@ -5,6 +5,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 
 use crate::backend::Backend;
 use crate::codec::Codec;
+use crate::container::Container;
 
 #[derive(Clone, Debug)]
 pub struct SubtitleInput {
@@ -15,6 +16,7 @@ pub struct SubtitleInput {
 pub struct EncodeOptions<'a> {
     pub codec: Codec,
     pub backend: Backend,
+    pub container: Container,
     pub quality: u8,
     /// `None` means: use the backend default (or omit `-preset` entirely if
     /// the backend has no preset concept, e.g. VAAPI).
@@ -57,7 +59,17 @@ pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result
         cmd.arg("-i").arg(&sub.path);
     }
 
-    cmd.args(["-map", "0"]);
+    match opts.container {
+        Container::Mkv => {
+            cmd.args(["-map", "0"]);
+        }
+        Container::Mp4 => {
+            // MP4 can't hold attachments, data streams, or image-based subs.
+            // Map only video, audio, and (text) subtitles, all optional so
+            // sources missing a track don't fail.
+            cmd.args(["-map", "0:v", "-map", "0:a?", "-map", "0:s?"]);
+        }
+    }
     for i in 0..opts.subtitles.len() {
         cmd.arg("-map").arg(format!("{}", i + 1));
     }
@@ -77,9 +89,15 @@ pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result
         cmd.arg(a);
     }
 
-    cmd.args([
-        "-c:a", "copy", "-c:s", "copy", "-c:d", "copy", "-c:t", "copy",
-    ]);
+    cmd.args(["-c:a", "copy"]);
+    match opts.container {
+        Container::Mkv => {
+            cmd.args(["-c:s", "copy", "-c:d", "copy", "-c:t", "copy"]);
+        }
+        Container::Mp4 => {
+            cmd.args(["-c:s", "mov_text"]);
+        }
+    }
 
     for (i, sub) in opts.subtitles.iter().enumerate() {
         if let Some(lang) = &sub.language {

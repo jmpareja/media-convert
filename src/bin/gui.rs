@@ -10,6 +10,7 @@ use egui_extras::{Column, TableBuilder};
 
 use media_convert::backend::Backend;
 use media_convert::codec::Codec;
+use media_convert::container::Container;
 use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
 use media_convert::{probe, scan};
 
@@ -96,6 +97,7 @@ struct App {
     output: Option<PathBuf>,
     codec: Codec,
     backend: Backend,
+    container: Container,
     quality: u8,
     preset: String,
     force: bool,
@@ -123,6 +125,7 @@ impl Default for App {
             output: None,
             codec,
             backend,
+            container: Container::Mkv,
             quality: cfg.default_quality,
             preset: cfg.default_preset.unwrap_or("").to_string(),
             force: false,
@@ -275,6 +278,7 @@ impl App {
         self.files.clear();
 
         let codec = self.codec;
+        let container = self.container;
         let force = self.force;
         let recurse = self.recurse;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -297,7 +301,7 @@ impl App {
                     .unwrap_or(abs.as_path())
                     .to_path_buf();
                 let mut out = output.join(&rel);
-                out.set_extension("mkv");
+                out.set_extension(container.extension());
 
                 let (source_codec, duration_secs, source_subtitle_count, decision) =
                     if out.exists() {
@@ -390,6 +394,7 @@ impl App {
 
         let codec = self.codec;
         let backend = self.backend;
+        let container = self.container;
         let quality = self.quality;
         let preset = self.preset.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -415,6 +420,7 @@ impl App {
                 let opts = EncodeOptions {
                     codec,
                     backend,
+                    container,
                     quality,
                     preset: preset_opt,
                     subtitles: &subs,
@@ -719,6 +725,14 @@ impl eframe::App for App {
                 if self.codec != prev_codec || self.backend != prev_backend {
                     self.reset_to_backend_defaults();
                 }
+                ui.separator();
+                ui.label("Container:");
+                egui::ComboBox::from_id_salt("container_combo")
+                    .selected_text(self.container.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.container, Container::Mkv, "mkv");
+                        ui.selectable_value(&mut self.container, Container::Mp4, "mp4");
+                    });
                 let cfg = self.backend.config(self.codec);
                 ui.separator();
                 ui.label(format!("{}:", cfg.quality_flag.trim_start_matches('-')));
