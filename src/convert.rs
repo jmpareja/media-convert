@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -66,9 +67,9 @@ pub(crate) fn build_ffmpeg_command(
         cmd.arg(a);
     }
 
-    cmd.arg("-i").arg(input);
+    cmd.arg("-i").arg(file_protocol_arg(input));
     for sub in opts.subtitles {
-        cmd.arg("-i").arg(&sub.path);
+        cmd.arg("-i").arg(file_protocol_arg(&sub.path));
     }
 
     match opts.container {
@@ -119,8 +120,18 @@ pub(crate) fn build_ffmpeg_command(
         }
     }
 
-    cmd.arg(output);
+    cmd.arg(file_protocol_arg(output));
     cmd
+}
+
+/// Wrap a filesystem path with the explicit `file:` protocol prefix so ffmpeg
+/// won't mistake colons embedded in the path (e.g. gvfs SMB mounts under
+/// `/run/user/.../gvfs/smb-share:server=…/…`) for a `protocol:options`
+/// pair. This is the documented escape hatch in the ffmpeg manual.
+fn file_protocol_arg(p: &Path) -> OsString {
+    let mut s = OsString::from("file:");
+    s.push(p.as_os_str());
+    s
 }
 
 /// Drain ffmpeg's `-progress` stream until EOF, invoking `on_progress` with a
@@ -328,9 +339,9 @@ mod tests {
             .map(|(i, _)| &args[i + 1])
             .collect();
         assert_eq!(inputs.len(), 3);
-        assert_eq!(inputs[0], "/in/a.mp4");
-        assert_eq!(inputs[1], "/in/a.en.srt");
-        assert_eq!(inputs[2], "/in/a.fr.srt");
+        assert_eq!(inputs[0], "file:/in/a.mp4");
+        assert_eq!(inputs[1], "file:/in/a.en.srt");
+        assert_eq!(inputs[2], "file:/in/a.fr.srt");
         // Sidecar maps reference inputs 1 and 2
         assert!(args.windows(2).any(|w| w == ["-map", "1"]));
         assert!(args.windows(2).any(|w| w == ["-map", "2"]));
@@ -366,7 +377,33 @@ mod tests {
             &opts_software_x265(),
         );
         let args = args_of(&cmd);
-        assert_eq!(args.last().map(String::as_str), Some("/out/dir/a.mkv"));
+        assert_eq!(args.last().map(String::as_str), Some("file:/out/dir/a.mkv"));
+    }
+
+    #[test]
+    fn paths_with_colons_get_file_protocol_prefix() {
+        // Reproduces the gvfs SMB-mount case: a path like
+        // `…/smb-share:server=…` would otherwise look like a `protocol:options`
+        // pair to ffmpeg and fail to open. The `file:` prefix forces the file
+        // protocol regardless of what's in the path.
+        let input = Path::new(
+            "/run/user/1000/gvfs/smb-share:server=192.168.1.134,share=tv/Firefly (2002)/ep1.mp4",
+        );
+        let output = Path::new(
+            "/run/user/1000/gvfs/smb-share:server=192.168.1.134,share=tv/Firefly (2002)-converted/ep1.mkv",
+        );
+        let cmd = build_ffmpeg_command(input, output, &opts_software_x265());
+        let args = args_of(&cmd);
+
+        let i_idx = args.iter().position(|a| a == "-i").expect("has -i");
+        assert_eq!(
+            args[i_idx + 1],
+            "file:/run/user/1000/gvfs/smb-share:server=192.168.1.134,share=tv/Firefly (2002)/ep1.mp4"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("file:/run/user/1000/gvfs/smb-share:server=192.168.1.134,share=tv/Firefly (2002)-converted/ep1.mkv")
+        );
     }
 
     fn collect_progress(input: &[u8], total_secs: Option<f64>) -> Vec<Option<f64>> {
