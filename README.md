@@ -2,7 +2,8 @@
 
 Re-encode a media library to a target codec (HEVC/x265 or AV1), preserving the
 source directory tree. Ships as a CLI and an egui-based GUI. Supports CPU
-encoding (best compression) and three hardware backends.
+encoding (best compression) and three hardware backends, output to MKV or MP4,
+and optional embedding of sidecar `.srt` subtitle files.
 
 ## Requirements
 
@@ -84,18 +85,45 @@ Builds and installs `media-convert` and `media-convert-gui` to
 media-convert --source ./in --output ./out [options]
 ```
 
+`--source` accepts either a directory (scanned for video files) or a single
+video file.
+
 Common flags:
 
 | Flag | Purpose |
 |---|---|
+| `-s, --source <path>` | Source directory or single video file |
+| `-o, --output <path>` | Output directory (mirrors the source tree) |
 | `-c, --codec <x265\|av1>` | Target codec (default `x265`) |
 | `-b, --backend <software\|nvenc\|qsv\|vaapi>` | Encoder backend (default `software`) |
-| `--quality <N>` | CRF/CQ/QP value; backend-aware default |
+| `--container <mkv\|mp4>` | Output container (default `mkv`) |
+| `--quality <N>` | CRF/CQ/QP value (0-63); backend-aware default |
 | `--preset <name>` | Encoder preset; backend-aware default |
+| `--embed-subtitles` | Mux sidecar `.srt` files next to each source into the output |
+| `--no-recurse` | Don't descend into subdirectories of `--source` |
 | `--dry-run` | Scan and report what would be converted |
 | `--force` | Re-encode even if source already matches target |
 
-While encoding, the CLI prints a redrawn `[i/N] NN% file.mkv` line per file.
+While encoding, the CLI prints a redrawn `[i/N] NN% file.<ext>` line per file.
+
+### Examples
+
+```bash
+# Re-encode a library to HEVC/MKV, software (best compression)
+media-convert -s ~/Videos -o ~/Videos-x265
+
+# Hardware-accelerated AV1 with NVENC
+media-convert -s ~/Videos -o ~/Videos-av1 -c av1 -b nvenc
+
+# Single file, output to MP4 with mov_text subtitles
+media-convert -s ./episode.mkv -o ./out --container mp4
+
+# Embed any movie.en.srt / movie.ger.srt sidecars next to each input
+media-convert -s ~/Videos -o ~/Videos-x265 --embed-subtitles
+
+# Preview only — no encoding
+media-convert -s ~/Videos -o ~/Videos-x265 --dry-run
+```
 
 ## GUI
 
@@ -103,8 +131,11 @@ While encoding, the CLI prints a redrawn `[i/N] NN% file.mkv` line per file.
 media-convert-gui
 ```
 
-Pick source and output directories, configure codec/backend/quality, **Scan**,
-then **Convert**. The Status column shows live `encoding NN%` per file.
+Pick a source (folder or single file) and an output directory, configure
+codec / backend / container / quality, **Scan**, then **Convert**. The Status
+column shows live `encoding NN%` per file. Toggle "Embed sidecar SRT
+subtitles" to mux any `movie.srt` / `movie.en.srt`-style files alongside each
+source.
 
 ## Backends
 
@@ -134,10 +165,33 @@ quality than software encoders.
 
 ## Output
 
-Each input is re-muxed into `.mkv` at the mirrored path under `--output`. All
-audio, subtitle, data and attachment streams are stream-copied (`-c:a copy`,
-`-c:s copy`, `-c:d copy`, `-c:t copy`). Files whose video stream already
-matches the target codec are skipped unless `--force` is passed.
+Each input is re-muxed at the mirrored path under `--output`, with the
+extension determined by `--container`:
+
+- **MKV** (default): preserves all tracks. `-map 0` plus `-c:a copy`,
+  `-c:s copy`, `-c:d copy`, `-c:t copy` keeps audio, subtitles, data
+  streams, and attachments (e.g. fonts) intact. Best for archival.
+- **MP4**: selective mapping (`-map 0:v -map 0:a? -map 0:s?`). Subtitles
+  are transcoded to `mov_text` (3GPP timed text); image-based subs (PGS,
+  DVB), data streams, and attachments are dropped. Use this for broad
+  player compatibility.
+
+Files whose video stream already matches the target codec are skipped unless
+`--force` is passed. Files whose output already exists are skipped
+unconditionally — delete the output and re-run to redo a single file.
+
+## Subtitle handling
+
+By default, subtitle tracks already inside the source are passed through
+(MKV) or transcoded to `mov_text` (MP4). Pass `--embed-subtitles` to also
+auto-discover sidecar `.srt` files next to each source and mux them in as
+extra tracks. The discovery rules:
+
+- A file in the same directory whose stem matches the video stem exactly,
+  e.g. `movie.srt` next to `movie.mp4`.
+- Or whose stem starts with `<video-stem>.<lang>`, e.g. `movie.en.srt`,
+  `movie.ger.srt`. Two- or three-letter ASCII codes are tagged as the
+  subtitle's `language` metadata.
 
 ## License
 
