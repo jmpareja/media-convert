@@ -1,0 +1,698 @@
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use eframe::egui;
+use egui_extras::{Column, TableBuilder};
+
+use media_convert::backend::Backend;
+use media_convert::codec::Codec;
+use media_convert::convert::{EncodeOptions, read_progress, spawn_encode};
+use media_convert::{probe, scan};
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 700.0])
+            .with_min_inner_size([700.0, 400.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "media-convert",
+        options,
+        Box::new(|_cc| Ok(Box::new(App::default()))),
+    )
+}
+
+#[derive(Clone, Debug)]
+enum Decision {
+    Encode,
+    SkipAlreadyTarget,
+    SkipOutputExists,
+}
+
+#[derive(Clone, Debug)]
+enum Status {
+    Pending,
+    Encoding(Option<f64>),
+    Done,
+    Failed(String),
+    Canceled,
+}
+
+#[derive(Clone, Debug)]
+struct FileEntry {
+    abs: PathBuf,
+    rel: PathBuf,
+    output: PathBuf,
+    source_codec: Option<String>,
+    duration_secs: Option<f64>,
+    decision: Decision,
+    status: Status,
+}
+
+enum ScanMsg {
+    Discovered(FileEntry),
+    Error(String),
+    Done(usize), // total scanned
+}
+
+enum EncodeMsg {
+    Started(usize),
+    Progress(usize, f64),
+    Finished(usize, std::result::Result<(), String>),
+    Canceled(usize),
+    AllDone,
+}
+
+struct ScanWorker {
+    rx: Receiver<ScanMsg>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct EncodeWorker {
+    rx: Receiver<EncodeMsg>,
+    cancel: Arc<AtomicBool>,
+    current_child: Arc<Mutex<Option<Child>>>,
+}
+
+struct App {
+    source: Option<PathBuf>,
+    output: Option<PathBuf>,
+    codec: Codec,
+    backend: Backend,
+    quality: u8,
+    preset: String,
+    force: bool,
+
+    files: Vec<FileEntry>,
+
+    scanner: Option<ScanWorker>,
+    encoder: Option<EncodeWorker>,
+
+    log: Vec<String>,
+    selected_only_encode: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let codec = Codec::X265;
+        let backend = Backend::Software;
+        let cfg = backend.config(codec);
+        Self {
+            source: None,
+            output: None,
+            codec,
+            backend,
+            quality: cfg.default_quality,
+            preset: cfg.default_preset.unwrap_or("").to_string(),
+            force: false,
+            files: Vec::new(),
+            scanner: None,
+            encoder: None,
+            log: Vec::new(),
+            selected_only_encode: true,
+        }
+    }
+}
+
+impl App {
+    fn reset_to_backend_defaults(&mut self) {
+        let cfg = self.backend.config(self.codec);
+        self.quality = cfg.default_quality;
+        self.preset = cfg.default_preset.unwrap_or("").to_string();
+    }
+}
+
+impl App {
+    fn log(&mut self, msg: impl Into<String>) {
+        let s = msg.into();
+        eprintln!("{s}");
+        self.log.push(s);
+        if self.log.len() > 500 {
+            let drop = self.log.len() - 500;
+            self.log.drain(..drop);
+        }
+    }
+
+    fn pick_dir(&mut self, kind: &str) -> Option<PathBuf> {
+        let start = match kind {
+            "source" => self.source.clone(),
+            _ => self.output.clone(),
+        };
+        let mut dlg = rfd::FileDialog::new();
+        if let Some(p) = start {
+            dlg = dlg.set_directory(p);
+        }
+        dlg.pick_folder()
+    }
+
+    fn start_scan(&mut self) {
+        let Some(source) = self.source.clone() else {
+            self.log("scan: pick a source directory first");
+            return;
+        };
+        let Some(output) = self.output.clone() else {
+            self.log("scan: pick an output directory first");
+            return;
+        };
+        if !source.is_dir() {
+            self.log(format!("scan: source is not a directory: {}", source.display()));
+            return;
+        }
+
+        self.files.clear();
+
+        let codec = self.codec;
+        let force = self.force;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = cancel.clone();
+        let (tx, rx) = channel();
+
+        thread::spawn(move || {
+            let videos = scan::find_videos(&source);
+            for abs in videos.iter() {
+                if cancel_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let rel = abs
+                    .strip_prefix(&source)
+                    .unwrap_or(abs.as_path())
+                    .to_path_buf();
+                let mut out = output.join(&rel);
+                out.set_extension("mkv");
+
+                let (source_codec, duration_secs, decision) = if out.exists() {
+                    (None, None, Decision::SkipOutputExists)
+                } else {
+                    match probe::video_info(abs) {
+                        Ok(info) => {
+                            let dec = if force || !codec.matches_source(&info.codec) {
+                                Decision::Encode
+                            } else {
+                                Decision::SkipAlreadyTarget
+                            };
+                            (Some(info.codec), info.duration_secs, dec)
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ScanMsg::Error(format!(
+                                "probe failed for {}: {e:#}",
+                                rel.display()
+                            )));
+                            continue;
+                        }
+                    }
+                };
+
+                let entry = FileEntry {
+                    abs: abs.clone(),
+                    rel,
+                    output: out,
+                    source_codec,
+                    duration_secs,
+                    decision,
+                    status: Status::Pending,
+                };
+                if tx.send(ScanMsg::Discovered(entry)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(ScanMsg::Done(videos.len()));
+        });
+
+        self.scanner = Some(ScanWorker { rx, cancel });
+        self.log("scan: started");
+    }
+
+    fn cancel_scan(&mut self) {
+        if let Some(s) = &self.scanner {
+            s.cancel.store(true, Ordering::Relaxed);
+            self.log("scan: cancel requested");
+        }
+    }
+
+    fn start_encode(&mut self) {
+        if self.encoder.is_some() {
+            self.log("encode: already running");
+            return;
+        }
+        let jobs: Vec<(usize, FileEntry)> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f.decision, Decision::Encode))
+            .filter(|(_, f)| !matches!(f.status, Status::Done))
+            .map(|(i, f)| (i, f.clone()))
+            .collect();
+
+        if jobs.is_empty() {
+            self.log("encode: nothing to do (run Scan first, or no encodable files)");
+            return;
+        }
+
+        let codec = self.codec;
+        let backend = self.backend;
+        let quality = self.quality;
+        let preset = self.preset.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = cancel.clone();
+        let current_child = Arc::new(Mutex::new(None::<Child>));
+        let current_child_thread = current_child.clone();
+        let (tx, rx) = channel::<EncodeMsg>();
+
+        thread::spawn(move || {
+            let preset_opt: Option<&str> = if preset.is_empty() {
+                None
+            } else {
+                Some(preset.as_str())
+            };
+            let opts = EncodeOptions {
+                codec,
+                backend,
+                quality,
+                preset: preset_opt,
+            };
+
+            for (idx, entry) in jobs {
+                if cancel_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                if tx.send(EncodeMsg::Started(idx)).is_err() {
+                    break;
+                }
+                let result = run_one(
+                    &entry.abs,
+                    &entry.output,
+                    &opts,
+                    &current_child_thread,
+                    idx,
+                    entry.duration_secs,
+                    &tx,
+                );
+                if cancel_thread.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&entry.output);
+                    let _ = tx.send(EncodeMsg::Canceled(idx));
+                    break;
+                }
+                let _ = tx.send(EncodeMsg::Finished(
+                    idx,
+                    result.map_err(|e| format!("{e:#}")),
+                ));
+            }
+            let _ = tx.send(EncodeMsg::AllDone);
+        });
+
+        self.encoder = Some(EncodeWorker {
+            rx,
+            cancel,
+            current_child,
+        });
+        self.log("encode: started");
+    }
+
+    fn cancel_encode(&mut self) {
+        if let Some(e) = &self.encoder {
+            e.cancel.store(true, Ordering::Relaxed);
+            if let Ok(mut guard) = e.current_child.lock() {
+                if let Some(child) = guard.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+            self.log("encode: cancel requested");
+        }
+    }
+
+    fn drain_workers(&mut self, ctx: &egui::Context) {
+        let mut needs_repaint = false;
+        let mut deferred_log: Vec<String> = Vec::new();
+        let mut clear_scanner = false;
+        let mut clear_encoder = false;
+
+        if let Some(s) = &self.scanner {
+            loop {
+                match s.rx.try_recv() {
+                    Ok(ScanMsg::Discovered(entry)) => {
+                        self.files.push(entry);
+                        needs_repaint = true;
+                    }
+                    Ok(ScanMsg::Error(msg)) => {
+                        deferred_log.push(msg);
+                        needs_repaint = true;
+                    }
+                    Ok(ScanMsg::Done(n)) => {
+                        deferred_log.push(format!("scan: complete, {n} file(s)"));
+                        clear_scanner = true;
+                        needs_repaint = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        clear_scanner = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = &self.encoder {
+            loop {
+                match e.rx.try_recv() {
+                    Ok(EncodeMsg::Started(idx)) => {
+                        if let Some(f) = self.files.get_mut(idx) {
+                            f.status = Status::Encoding(None);
+                        }
+                        needs_repaint = true;
+                    }
+                    Ok(EncodeMsg::Progress(idx, frac)) => {
+                        if let Some(f) = self.files.get_mut(idx) {
+                            if matches!(f.status, Status::Encoding(_)) {
+                                f.status = Status::Encoding(Some(frac));
+                            }
+                        }
+                        needs_repaint = true;
+                    }
+                    Ok(EncodeMsg::Finished(idx, result)) => {
+                        if let Some(f) = self.files.get_mut(idx) {
+                            let rel_display = f.rel.display().to_string();
+                            match result {
+                                Ok(()) => {
+                                    f.status = Status::Done;
+                                    deferred_log.push(format!("ok: {rel_display}"));
+                                }
+                                Err(msg) => {
+                                    f.status = Status::Failed(msg.clone());
+                                    deferred_log.push(format!("FAIL: {rel_display} ({msg})"));
+                                }
+                            }
+                        }
+                        needs_repaint = true;
+                    }
+                    Ok(EncodeMsg::Canceled(idx)) => {
+                        if let Some(f) = self.files.get_mut(idx) {
+                            f.status = Status::Canceled;
+                            deferred_log.push(format!("canceled: {}", f.rel.display()));
+                        }
+                        needs_repaint = true;
+                    }
+                    Ok(EncodeMsg::AllDone) => {
+                        deferred_log.push("encode: complete".into());
+                        clear_encoder = true;
+                        needs_repaint = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        clear_encoder = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if clear_scanner {
+            self.scanner = None;
+        }
+        if clear_encoder {
+            self.encoder = None;
+        }
+        for line in deferred_log {
+            self.log(line);
+        }
+
+        if self.scanner.is_some() || self.encoder.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        } else if needs_repaint {
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn run_one(
+    input: &Path,
+    output: &Path,
+    opts: &EncodeOptions,
+    slot: &Arc<Mutex<Option<Child>>>,
+    idx: usize,
+    duration_secs: Option<f64>,
+    tx: &Sender<EncodeMsg>,
+) -> anyhow::Result<()> {
+    use anyhow::{anyhow, bail};
+
+    let mut child = spawn_encode(input, output, opts)?;
+    let stdout = child.stdout.take();
+    {
+        let mut guard = slot.lock().expect("child slot poisoned");
+        *guard = Some(child);
+    }
+
+    let progress_thread = stdout.map(|stdout| {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            read_progress(stdout, duration_secs, |frac| {
+                if let Some(f) = frac {
+                    let _ = tx.send(EncodeMsg::Progress(idx, f));
+                }
+            });
+        })
+    });
+
+    // Poll for completion with brief locks so cancel_encode can grab the
+    // lock and call Child::kill() (SIGKILL) without waiting hours for the
+    // current encode to finish.
+    let status = loop {
+        {
+            let mut guard = slot.lock().expect("child slot poisoned");
+            match guard.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => { /* still running */ }
+                    Err(e) => return Err(anyhow!("waiting on ffmpeg: {e}")),
+                },
+                None => bail!("ffmpeg child slot cleared unexpectedly"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    {
+        let mut guard = slot.lock().expect("child slot poisoned");
+        *guard = None;
+    }
+
+    if let Some(h) = progress_thread {
+        let _ = h.join();
+    }
+
+    if !status.success() {
+        let _ = std::fs::remove_file(output);
+        bail!("ffmpeg exited with {}", status);
+    }
+    Ok(())
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_workers(ctx);
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Source…").clicked() {
+                    if let Some(p) = self.pick_dir("source") {
+                        self.source = Some(p);
+                    }
+                }
+                ui.label(
+                    self.source
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".into()),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Output…").clicked() {
+                    if let Some(p) = self.pick_dir("output") {
+                        self.output = Some(p);
+                    }
+                }
+                ui.label(
+                    self.output
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".into()),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Codec:");
+                let prev_codec = self.codec;
+                egui::ComboBox::from_id_salt("codec_combo")
+                    .selected_text(self.codec.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.codec, Codec::X265, "x265");
+                        ui.selectable_value(&mut self.codec, Codec::Av1, "av1");
+                    });
+                ui.separator();
+                ui.label("Backend:");
+                let prev_backend = self.backend;
+                egui::ComboBox::from_id_salt("backend_combo")
+                    .selected_text(self.backend.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.backend, Backend::Software, "software");
+                        ui.selectable_value(&mut self.backend, Backend::Nvenc, "nvenc");
+                        ui.selectable_value(&mut self.backend, Backend::Qsv, "qsv");
+                        ui.selectable_value(&mut self.backend, Backend::Vaapi, "vaapi");
+                    });
+                if self.codec != prev_codec || self.backend != prev_backend {
+                    self.reset_to_backend_defaults();
+                }
+                let cfg = self.backend.config(self.codec);
+                ui.separator();
+                ui.label(format!("{}:", cfg.quality_flag.trim_start_matches('-')));
+                ui.add(egui::Slider::new(&mut self.quality, 0..=63));
+                ui.separator();
+                ui.label("Preset:");
+                ui.add_enabled(
+                    cfg.default_preset.is_some(),
+                    egui::TextEdit::singleline(&mut self.preset).desired_width(80.0),
+                );
+                ui.separator();
+                ui.checkbox(&mut self.force, "Force re-encode");
+            });
+            ui.horizontal(|ui| {
+                let scanning = self.scanner.is_some();
+                let encoding = self.encoder.is_some();
+                ui.add_enabled_ui(!scanning && !encoding, |ui| {
+                    if ui.button("Scan").clicked() {
+                        self.start_scan();
+                    }
+                });
+                ui.add_enabled_ui(scanning, |ui| {
+                    if ui.button("Cancel scan").clicked() {
+                        self.cancel_scan();
+                    }
+                });
+                ui.separator();
+                ui.add_enabled_ui(!encoding && !self.files.is_empty(), |ui| {
+                    if ui.button("Convert").clicked() {
+                        self.start_encode();
+                    }
+                });
+                ui.add_enabled_ui(encoding, |ui| {
+                    if ui.button("Stop").clicked() {
+                        self.cancel_encode();
+                    }
+                });
+                ui.separator();
+                ui.checkbox(&mut self.selected_only_encode, "Show only to-encode");
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::TopBottomPanel::bottom("bottom")
+            .resizable(true)
+            .default_height(140.0)
+            .show(ctx, |ui| {
+                ui.label("Log:");
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.log {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let summary = summarize(&self.files);
+            ui.label(format!(
+                "Files: {total}  |  to encode: {to_encode}  |  done: {done}  |  failed: {failed}  |  skipped: {skipped}",
+                total = summary.total,
+                to_encode = summary.to_encode,
+                done = summary.done,
+                failed = summary.failed,
+                skipped = summary.skipped,
+            ));
+            ui.separator();
+
+            let only_encode = self.selected_only_encode;
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .column(Column::remainder().at_least(200.0))
+                .column(Column::auto().at_least(80.0))
+                .column(Column::auto().at_least(120.0))
+                .column(Column::auto().at_least(200.0))
+                .header(20.0, |mut header| {
+                    header.col(|ui| { ui.strong("File"); });
+                    header.col(|ui| { ui.strong("Source codec"); });
+                    header.col(|ui| { ui.strong("Decision"); });
+                    header.col(|ui| { ui.strong("Status"); });
+                })
+                .body(|mut body| {
+                    for f in self.files.iter().filter(|f| {
+                        !only_encode || matches!(f.decision, Decision::Encode)
+                    }) {
+                        body.row(18.0, |mut row| {
+                            row.col(|ui| {
+                                ui.monospace(f.rel.display().to_string());
+                            });
+                            row.col(|ui| {
+                                ui.label(f.source_codec.as_deref().unwrap_or("-"));
+                            });
+                            row.col(|ui| {
+                                ui.label(decision_label(&f.decision));
+                            });
+                            row.col(|ui| {
+                                ui.label(status_label(&f.status));
+                            });
+                        });
+                    }
+                });
+        });
+    }
+}
+
+#[derive(Default)]
+struct Summary {
+    total: usize,
+    to_encode: usize,
+    done: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+fn summarize(files: &[FileEntry]) -> Summary {
+    let mut s = Summary::default();
+    s.total = files.len();
+    for f in files {
+        match (&f.decision, &f.status) {
+            (_, Status::Done) => s.done += 1,
+            (_, Status::Failed(_)) => s.failed += 1,
+            (Decision::SkipAlreadyTarget | Decision::SkipOutputExists, _) => s.skipped += 1,
+            (Decision::Encode, _) => s.to_encode += 1,
+        }
+    }
+    s
+}
+
+fn decision_label(d: &Decision) -> &'static str {
+    match d {
+        Decision::Encode => "encode",
+        Decision::SkipAlreadyTarget => "skip (already target)",
+        Decision::SkipOutputExists => "skip (output exists)",
+    }
+}
+
+fn status_label(s: &Status) -> String {
+    match s {
+        Status::Pending => "pending".into(),
+        Status::Encoding(None) => "encoding…".into(),
+        Status::Encoding(Some(p)) => format!("encoding {:>3}%", (p * 100.0) as u32),
+        Status::Done => "done".into(),
+        Status::Failed(msg) => format!("failed: {msg}"),
+        Status::Canceled => "canceled".into(),
+    }
+}

@@ -1,0 +1,48 @@
+use clap::Parser;
+use std::path::PathBuf;
+
+use media_convert::backend::Backend;
+use media_convert::codec::Codec;
+
+#[derive(Parser, Debug)]
+#[command(version, about = "Re-encode a media library to a target codec")]
+pub struct Cli {
+    /// Source directory to scan for video files
+    #[arg(short, long)]
+    pub source: PathBuf,
+
+    /// Output directory; converted files mirror the source tree as .mkv
+    #[arg(short, long)]
+    pub output: PathBuf,
+
+    /// Target video codec
+    #[arg(short, long, value_enum, default_value_t = Codec::X265)]
+    pub codec: Codec,
+
+    /// Encoder backend. `software` is libx265/libsvtav1 (best compression).
+    /// `nvenc` (NVIDIA), `qsv` (Intel iGPU) and `vaapi` (Linux AMD/Intel) are
+    /// hardware-accelerated and much faster but produce larger files at
+    /// equivalent visual quality.
+    #[arg(short, long, value_enum, default_value_t = Backend::Software)]
+    pub backend: Backend,
+
+    /// Quality value; flag and scale depend on backend
+    /// (software/nvenc/qsv: lower=better, ~18-30; vaapi -qp: ~20-30).
+    /// If omitted, a backend-aware default is used.
+    #[arg(long)]
+    pub quality: Option<u8>,
+
+    /// Encoder preset. Defaults are backend/codec-specific.
+    /// libx265: ultrafast..placebo. libsvtav1: 0-13 (lower=slower/better).
+    /// nvenc: p1..p7. qsv: veryfast..veryslow. vaapi: ignored.
+    #[arg(long)]
+    pub preset: Option<String>,
+
+    /// Scan and report what would be converted, without running ffmpeg
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Re-encode even if the source video stream is already in the target codec
+    #[arg(long)]
+    pub force: bool,
+}
