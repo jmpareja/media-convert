@@ -2,10 +2,11 @@ use clap::ValueEnum;
 
 use crate::codec::Codec;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum Backend {
     /// CPU encoders (libx265 / libsvtav1). Best compression, slowest.
+    #[default]
     Software,
     /// NVIDIA NVENC (hevc_nvenc / av1_nvenc). Fast, larger files than software.
     Nvenc,
@@ -13,12 +14,6 @@ pub enum Backend {
     Qsv,
     /// VAAPI (Linux). Works with AMD and Intel iGPUs.
     Vaapi,
-}
-
-impl Default for Backend {
-    fn default() -> Self {
-        Backend::Software
-    }
 }
 
 /// Concrete ffmpeg invocation parameters for a (codec, backend) pair.

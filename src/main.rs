@@ -170,10 +170,10 @@ fn validate(args: &Cli) -> Result<bool> {
     require_on_path("ffmpeg")?;
     require_on_path("ffprobe")?;
 
-    if let Some(q) = args.quality {
-        if q > 63 {
-            bail!("--quality must be 0-63 (got {q}); see backend docs for the meaningful range");
-        }
+    if let Some(q) = args.quality
+        && q > 63
+    {
+        bail!("--quality must be 0-63 (got {q}); see backend docs for the meaningful range");
     }
 
     let single_file_mode = if args.source.is_file() {
@@ -223,10 +223,10 @@ fn output_is_filepath(p: &Path) -> bool {
     if p.is_file() {
         return true;
     }
-    if let Some(s) = p.to_str() {
-        if s.ends_with('/') || s.ends_with(std::path::MAIN_SEPARATOR) {
-            return false;
-        }
+    if let Some(s) = p.to_str()
+        && (s.ends_with('/') || s.ends_with(std::path::MAIN_SEPARATOR))
+    {
+        return false;
     }
     p.extension().is_some()
 }
