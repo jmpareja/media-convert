@@ -13,9 +13,10 @@ pub struct Cli {
     pub source: PathBuf,
 
     /// Output directory; converted files mirror the source tree using the
-    /// container extension chosen by --container.
+    /// container extension chosen by --container. If omitted, defaults to a
+    /// sibling of the source directory named "<source>-converted".
     #[arg(short, long)]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 
     /// Target video codec
     #[arg(short, long, value_enum, default_value_t = Codec::X265)]

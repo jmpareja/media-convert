@@ -10,11 +10,29 @@ use cli::Cli;
 use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{self, EncodeOptions};
+use media_convert::output::{default_output_dir, sum_file_sizes, validate_output};
 use media_convert::{probe, scan};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
     let single_file_mode = validate(&args)?;
+
+    let output_root: PathBuf = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_dir(&args.source));
+    if args.output.is_none() {
+        println!(
+            "--output not given; defaulting to {}",
+            output_root.display()
+        );
+    }
+    if output_root.exists() && !output_root.is_dir() && !single_file_mode {
+        bail!(
+            "--output exists and is not a directory: {}",
+            output_root.display()
+        );
+    }
 
     let videos = scan::find_videos(&args.source, !args.no_recurse);
     if videos.is_empty() {
@@ -26,6 +44,19 @@ fn main() -> Result<()> {
         videos.len(),
         args.codec.label()
     );
+
+    // Skip the output-dir validation when the user is writing a single file
+    // to an explicit filepath (we'd be creating a parent dir, not the
+    // filepath itself, and ffmpeg handles that on demand).
+    let validate_output_dir = !(single_file_mode && output_is_filepath(&output_root));
+    if validate_output_dir && !args.dry_run {
+        let total = sum_file_sizes(&videos);
+        let v = validate_output(&output_root, Some(total))
+            .with_context(|| format!("output directory check failed: {}", output_root.display()))?;
+        for w in &v.warnings {
+            eprintln!("warning: {w}");
+        }
+    }
 
     let rel_root: PathBuf = if single_file_mode {
         args.source
@@ -50,10 +81,10 @@ fn main() -> Result<()> {
             .strip_prefix(&rel_root)
             .unwrap_or(input)
             .to_path_buf();
-        let output = if single_file_mode && output_is_filepath(&args.output) {
-            args.output.clone()
+        let output = if single_file_mode && output_is_filepath(&output_root) {
+            output_root.clone()
         } else {
-            output_path(&args.output, &rel, args.container)
+            output_path(&output_root, &rel, args.container)
         };
 
         let prefix = format!("[{}/{}]", idx + 1, videos.len());
@@ -191,13 +222,6 @@ fn validate(args: &Cli) -> Result<bool> {
     } else {
         bail!("source does not exist: {}", args.source.display());
     };
-
-    if args.output.exists() && !args.output.is_dir() && !single_file_mode {
-        bail!(
-            "--output exists and is not a directory: {}",
-            args.output.display()
-        );
-    }
 
     Ok(single_file_mode)
 }

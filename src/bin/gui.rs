@@ -12,6 +12,7 @@ use media_convert::backend::Backend;
 use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
+use media_convert::output::{default_output_dir, sum_file_sizes, validate_output};
 use media_convert::{probe, scan};
 
 fn main() -> eframe::Result<()> {
@@ -148,6 +149,16 @@ impl App {
         self.quality = cfg.default_quality;
         self.preset = cfg.default_preset.unwrap_or("").to_string();
     }
+
+    /// Update `self.source`, and pre-fill `self.output` with a sensible
+    /// default if the user hasn't picked one yet. Existing user choices for
+    /// output are preserved so the user can override the suggestion.
+    fn set_source(&mut self, source: PathBuf) {
+        if self.output.is_none() {
+            self.output = Some(default_output_dir(&source));
+        }
+        self.source = Some(source);
+    }
 }
 
 impl App {
@@ -275,6 +286,21 @@ impl App {
             return;
         }
 
+        // Confirm the output directory is writable before kicking off a scan.
+        // Disk-space warnings happen later (at start_encode) once we know the
+        // total source size.
+        match validate_output(&output, None) {
+            Ok(v) => {
+                for w in v.warnings {
+                    self.notify_warning(w);
+                }
+            }
+            Err(e) => {
+                self.notify_error(format!("Output directory is not usable:\n{e:#}"));
+                return;
+            }
+        }
+
         self.files.clear();
 
         let codec = self.codec;
@@ -364,6 +390,32 @@ impl App {
             self.notify_warning("Encode is already running.");
             return;
         }
+
+        // Re-check the output directory now that we know the total source
+        // size — this surfaces low-disk-space warnings before we start
+        // burning encoder time.
+        if let Some(output) = self.output.clone() {
+            let to_encode_paths: Vec<PathBuf> = self
+                .files
+                .iter()
+                .filter(|f| matches!(f.decision, Decision::Encode))
+                .filter(|f| !matches!(f.status, Status::Done))
+                .map(|f| f.abs.clone())
+                .collect();
+            let total = sum_file_sizes(&to_encode_paths);
+            match validate_output(&output, Some(total)) {
+                Ok(v) => {
+                    for w in v.warnings {
+                        self.notify_warning(w);
+                    }
+                }
+                Err(e) => {
+                    self.notify_error(format!("Output directory is not usable:\n{e:#}"));
+                    return;
+                }
+            }
+        }
+
         let embed_subtitles = self.embed_subtitles;
         let jobs: Vec<(usize, FileEntry, Vec<SubtitleInput>)> = self
             .files
@@ -672,12 +724,12 @@ impl eframe::App for App {
                 if ui.button("Source folder…").clicked()
                     && let Some(p) = self.pick_dir("source")
                 {
-                    self.source = Some(p);
+                    self.set_source(p);
                 }
                 if ui.button("Source file…").clicked()
                     && let Some(p) = self.pick_source_file()
                 {
-                    self.source = Some(p);
+                    self.set_source(p);
                 }
                 ui.label(
                     self.source
