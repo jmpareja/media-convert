@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use media_convert::backend::Backend;
 use media_convert::codec::Codec;
+use media_convert::container::Container;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Re-encode a media library to a target codec")]
@@ -11,13 +12,20 @@ pub struct Cli {
     #[arg(short, long)]
     pub source: PathBuf,
 
-    /// Output directory; converted files mirror the source tree as .mkv
+    /// Output directory; converted files mirror the source tree using the
+    /// container extension chosen by --container.
     #[arg(short, long)]
     pub output: PathBuf,
 
     /// Target video codec
     #[arg(short, long, value_enum, default_value_t = Codec::X265)]
     pub codec: Codec,
+
+    /// Output container. `mkv` (default) preserves all tracks and attachments.
+    /// `mp4` is broadly compatible but transcodes subtitles to mov_text and
+    /// drops image-based subs / attachments / data streams.
+    #[arg(long, value_enum, default_value_t = Container::Mkv)]
+    pub container: Container,
 
     /// Encoder backend. `software` is libx265/libsvtav1 (best compression).
     /// `nvenc` (NVIDIA), `qsv` (Intel iGPU) and `vaapi` (Linux AMD/Intel) are
