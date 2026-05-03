@@ -12,6 +12,7 @@ use media_convert::backend::Backend;
 use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
+use media_convert::inhibit::Inhibitor;
 use media_convert::output::{default_output_dir, sum_file_sizes, validate_output};
 use media_convert::{probe, scan};
 
@@ -504,6 +505,10 @@ impl App {
             } else {
                 Some(preset.as_str())
             };
+
+            // Block screensaver / system sleep for the batch. Dropped when this
+            // closure returns (normal completion, cancel, or break).
+            let _inhibitor = Inhibitor::acquire("Encoding video files");
 
             for (idx, entry, subs) in jobs {
                 if cancel_thread.load(Ordering::Relaxed) {

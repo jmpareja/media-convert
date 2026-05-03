@@ -10,6 +10,7 @@ use cli::Cli;
 use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{self, EncodeOptions};
+use media_convert::inhibit::Inhibitor;
 use media_convert::output::{default_output_dir, sum_file_sizes, validate_output};
 use media_convert::{probe, scan};
 
@@ -75,6 +76,18 @@ fn main() -> Result<()> {
     let mut converted = 0u64;
     let mut skipped = 0u64;
     let mut failed = 0u64;
+
+    // Block the screensaver and system suspend for the duration of the encode
+    // batch. Dropped at the end of `main` (or on early return / panic).
+    let _inhibitor = if args.dry_run {
+        None
+    } else {
+        let inh = Inhibitor::acquire("Encoding video files");
+        if inh.is_active() {
+            println!("inhibited screensaver / system sleep via systemd-inhibit");
+        }
+        Some(inh)
+    };
 
     for (idx, input) in videos.iter().enumerate() {
         let rel = input
