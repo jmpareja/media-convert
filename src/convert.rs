@@ -24,10 +24,13 @@ pub struct EncodeOptions<'a> {
     pub preset: Option<&'a str>,
     /// External subtitle files to mux into the output as additional tracks.
     pub subtitles: &'a [SubtitleInput],
-    /// Number of subtitle streams already inside the source video; used to
-    /// compute output stream indices when tagging the language of the
-    /// sidecar SRTs we add.
-    pub source_subtitle_count: usize,
+    /// `codec_name` (from ffprobe) for each subtitle stream that's already
+    /// inside the source video, in source-stream order. The length doubles as
+    /// the count of source subtitle streams, used to compute output stream
+    /// indices for sidecar SRTs we add. Per-stream codec choice depends on
+    /// these — e.g. MKV target rejects `-c:s copy` for `mov_text`, so that
+    /// stream gets transcoded to SRT instead.
+    pub source_subtitle_codecs: &'a [String],
 }
 
 pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<Child> {
@@ -105,7 +108,27 @@ pub(crate) fn build_ffmpeg_command(
     cmd.args(["-c:a", "copy"]);
     match opts.container {
         Container::Mkv => {
-            cmd.args(["-c:s", "copy", "-c:d", "copy", "-c:t", "copy"]);
+            // Pick a per-stream subtitle codec for each known source sub:
+            // `mov_text` (MP4 timed text) isn't accepted by the matroska
+            // muxer's stream copy path, so it's transcoded to SRT. Anything
+            // else copies. If we have no codec info (probe failed), fall back
+            // to the historical `-c:s copy` which works for native-MKV subs
+            // and only fails on the mov_text-from-MP4 case.
+            if opts.source_subtitle_codecs.is_empty() {
+                cmd.args(["-c:s", "copy"]);
+            } else {
+                for (i, codec_name) in opts.source_subtitle_codecs.iter().enumerate() {
+                    let target = subtitle_codec_for_mkv(codec_name);
+                    cmd.arg(format!("-c:s:{i}")).arg(target);
+                }
+                // Sidecar SRTs (added as separate inputs) land at
+                // stream indices N..N+M; SRT copies cleanly into MKV.
+                let n = opts.source_subtitle_codecs.len();
+                for i in 0..opts.subtitles.len() {
+                    cmd.arg(format!("-c:s:{}", n + i)).arg("copy");
+                }
+            }
+            cmd.args(["-c:d", "copy", "-c:t", "copy"]);
         }
         Container::Mp4 => {
             cmd.args(["-c:s", "mov_text"]);
@@ -114,7 +137,7 @@ pub(crate) fn build_ffmpeg_command(
 
     for (i, sub) in opts.subtitles.iter().enumerate() {
         if let Some(lang) = &sub.language {
-            let stream_idx = opts.source_subtitle_count + i;
+            let stream_idx = opts.source_subtitle_codecs.len() + i;
             cmd.arg(format!("-metadata:s:s:{stream_idx}"))
                 .arg(format!("language={lang}"));
         }
@@ -122,6 +145,17 @@ pub(crate) fn build_ffmpeg_command(
 
     cmd.arg(file_protocol_arg(output));
     cmd
+}
+
+/// Pick the output subtitle codec to use for a given source subtitle codec
+/// when targeting MKV. The matroska muxer accepts most subtitle codecs as a
+/// stream copy, but rejects `mov_text` (MP4 3GPP timed text) — we transcode
+/// those to SRT, which all MKV players handle.
+fn subtitle_codec_for_mkv(source_codec: &str) -> &'static str {
+    match source_codec {
+        "mov_text" => "srt",
+        _ => "copy",
+    }
 }
 
 /// Wrap a filesystem path with the explicit `file:` protocol prefix so ffmpeg
@@ -220,7 +254,7 @@ mod tests {
             quality: 23,
             preset: None,
             subtitles: &[],
-            source_subtitle_count: 0,
+            source_subtitle_codecs: &[],
         }
     }
 
@@ -245,10 +279,66 @@ mod tests {
         // Bare `-map 0` (whole-stream copy)
         let map_idx = args.iter().position(|a| a == "-map").expect("has -map");
         assert_eq!(args[map_idx + 1], "0");
-        // MKV preserves subtitle/data/attachment streams without re-encoding
+        // No probe info for source subs → fall back to global `-c:s copy`,
+        // plus the always-present data and attachment copy flags
         assert!(args.windows(2).any(|w| w == ["-c:s", "copy"]));
         assert!(args.windows(2).any(|w| w == ["-c:d", "copy"]));
         assert!(args.windows(2).any(|w| w == ["-c:t", "copy"]));
+    }
+
+    #[test]
+    fn mkv_transcodes_mov_text_to_srt_and_copies_other_subs() {
+        // MP4 source with a mov_text track plus a subrip track. Matroska
+        // muxer rejects `-c:s copy` for mov_text, so we emit per-stream:
+        // stream 0 (mov_text) → srt; stream 1 (subrip) → copy.
+        let source_subs = ["mov_text".to_string(), "subrip".to_string()];
+        let mut opts = opts_software_x265();
+        opts.source_subtitle_codecs = &source_subs;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-c:s:0", "srt"]));
+        assert!(args.windows(2).any(|w| w == ["-c:s:1", "copy"]));
+        // The fallback global form must NOT be emitted when per-stream args
+        // are present, otherwise it would override the per-stream choice.
+        assert!(!args.windows(2).any(|w| w == ["-c:s", "copy"]));
+    }
+
+    #[test]
+    fn mkv_passes_image_subs_through_with_copy() {
+        // hdmv_pgs_subtitle (Blu-ray PGS) is image-based and CAN'T be turned
+        // into text. It must be copied through as-is — never transcoded.
+        let source_subs = ["hdmv_pgs_subtitle".to_string()];
+        let mut opts = opts_software_x265();
+        opts.source_subtitle_codecs = &source_subs;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-c:s:0", "copy"]));
+        assert!(!args.iter().any(|a| a == "srt"));
+    }
+
+    #[test]
+    fn mkv_per_stream_includes_sidecar_indices() {
+        // 1 source mov_text + 2 sidecar SRTs → output streams 0,1,2.
+        // Per-stream args should cover all three.
+        let subs = [
+            SubtitleInput {
+                path: PathBuf::from("/in/a.en.srt"),
+                language: None,
+            },
+            SubtitleInput {
+                path: PathBuf::from("/in/a.fr.srt"),
+                language: None,
+            },
+        ];
+        let source_subs = ["mov_text".to_string()];
+        let mut opts = opts_software_x265();
+        opts.subtitles = &subs;
+        opts.source_subtitle_codecs = &source_subs;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-c:s:0", "srt"]));
+        assert!(args.windows(2).any(|w| w == ["-c:s:1", "copy"]));
+        assert!(args.windows(2).any(|w| w == ["-c:s:2", "copy"]));
     }
 
     #[test]
@@ -326,9 +416,10 @@ mod tests {
                 language: Some("fr".into()),
             },
         ];
+        let source_subs = ["subrip".to_string(), "subrip".to_string()];
         let mut opts = opts_software_x265();
         opts.subtitles = &subs;
-        opts.source_subtitle_count = 2;
+        opts.source_subtitle_codecs = &source_subs;
         let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
         let args = args_of(&cmd);
         // Three -i in order: main input, sub1, sub2
@@ -345,7 +436,7 @@ mod tests {
         // Sidecar maps reference inputs 1 and 2
         assert!(args.windows(2).any(|w| w == ["-map", "1"]));
         assert!(args.windows(2).any(|w| w == ["-map", "2"]));
-        // Language metadata indices start from source_subtitle_count
+        // Language metadata indices start from the source-subtitle count
         assert!(
             args.windows(2)
                 .any(|w| w == ["-metadata:s:s:2", "language=en"])

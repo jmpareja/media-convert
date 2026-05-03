@@ -95,7 +95,7 @@ struct FileEntry {
     output: PathBuf,
     source_codec: Option<String>,
     duration_secs: Option<f64>,
-    source_subtitle_count: usize,
+    source_subtitle_codecs: Vec<String>,
     decision: Decision,
     status: Status,
 }
@@ -372,9 +372,9 @@ impl App {
                 let mut out = output.join(&rel);
                 out.set_extension(container.extension());
 
-                let (source_codec, duration_secs, source_subtitle_count, decision) =
+                let (source_codec, duration_secs, source_subtitle_codecs, decision) =
                     if out.exists() {
-                        (None, None, 0, Decision::SkipOutputExists)
+                        (None, None, Vec::new(), Decision::SkipOutputExists)
                     } else {
                         match probe::video_info(abs) {
                             Ok(info) => {
@@ -386,7 +386,7 @@ impl App {
                                 (
                                     Some(info.codec),
                                     info.duration_secs,
-                                    info.subtitle_count,
+                                    info.subtitle_codecs,
                                     dec,
                                 )
                             }
@@ -406,7 +406,7 @@ impl App {
                     output: out,
                     source_codec,
                     duration_secs,
-                    source_subtitle_count,
+                    source_subtitle_codecs,
                     decision,
                     status: Status::Pending,
                 };
@@ -519,7 +519,7 @@ impl App {
                     quality,
                     preset: preset_opt,
                     subtitles: &subs,
-                    source_subtitle_count: entry.source_subtitle_count,
+                    source_subtitle_codecs: &entry.source_subtitle_codecs,
                 };
                 let result = run_one(
                     &entry.abs,

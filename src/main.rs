@@ -116,7 +116,10 @@ fn main() -> Result<()> {
 
         let info = probe::video_info(input).ok();
         let duration = info.as_ref().and_then(|i| i.duration_secs);
-        let source_subtitle_count = info.as_ref().map(|i| i.subtitle_count).unwrap_or(0);
+        let source_subtitle_codecs: Vec<String> = info
+            .as_ref()
+            .map(|i| i.subtitle_codecs.clone())
+            .unwrap_or_default();
 
         let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles {
             scan::discover_subtitles(input)
@@ -143,7 +146,7 @@ fn main() -> Result<()> {
             quality,
             preset,
             subtitles: &subtitles,
-            source_subtitle_count,
+            source_subtitle_codecs: &source_subtitle_codecs,
         };
 
         let rel_str = rel.display().to_string();

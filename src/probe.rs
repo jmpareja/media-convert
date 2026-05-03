@@ -23,7 +23,17 @@ struct Format {
 pub struct VideoInfo {
     pub codec: String,
     pub duration_secs: Option<f64>,
-    pub subtitle_count: usize,
+    /// Codec name (`codec_name` from ffprobe) for each subtitle stream,
+    /// in source-stream order. Used by the encoder to pick a per-stream
+    /// output codec — MKV can't `-c:s copy` a `mov_text` track, for
+    /// instance, so it gets transcoded to SRT.
+    pub subtitle_codecs: Vec<String>,
+}
+
+impl VideoInfo {
+    pub fn subtitle_count(&self) -> usize {
+        self.subtitle_codecs.len()
+    }
 }
 
 pub fn video_info(path: &Path) -> Result<VideoInfo> {
@@ -49,11 +59,13 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
         .with_context(|| format!("failed to parse ffprobe JSON for {}", path.display()))?;
 
     let mut codec: Option<String> = None;
-    let mut subtitle_count = 0usize;
+    let mut subtitle_codecs: Vec<String> = Vec::new();
     for s in parsed.streams {
         match s.codec_type.as_deref() {
             Some("video") if codec.is_none() => codec = s.codec_name,
-            Some("subtitle") => subtitle_count += 1,
+            Some("subtitle") => {
+                subtitle_codecs.push(s.codec_name.unwrap_or_default());
+            }
             _ => {}
         }
     }
@@ -69,7 +81,7 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
     Ok(VideoInfo {
         codec,
         duration_secs,
-        subtitle_count,
+        subtitle_codecs,
     })
 }
 
