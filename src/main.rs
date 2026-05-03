@@ -205,3 +205,47 @@ fn output_is_filepath(p: &Path) -> bool {
     }
     p.extension().is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn nonexistent_with_extension_is_filepath() {
+        assert!(output_is_filepath(Path::new("/tmp/no/such/out.mkv")));
+        assert!(output_is_filepath(Path::new("relative.mp4")));
+    }
+
+    #[test]
+    fn nonexistent_without_extension_is_directory() {
+        assert!(!output_is_filepath(Path::new("/tmp/no/such/out")));
+        assert!(!output_is_filepath(Path::new("converted")));
+    }
+
+    #[test]
+    fn trailing_slash_means_directory_even_with_dot() {
+        assert!(!output_is_filepath(Path::new("/tmp/foo/")));
+    }
+
+    #[test]
+    fn existing_file_is_filepath() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("existing.mkv");
+        fs::write(&f, b"").unwrap();
+        assert!(output_is_filepath(&f));
+    }
+
+    #[test]
+    fn existing_directory_is_not_filepath() {
+        let dir = tempdir().unwrap();
+        assert!(!output_is_filepath(dir.path()));
+    }
+
+    #[test]
+    fn output_path_changes_extension_to_mkv() {
+        let out = output_path(Path::new("/out"), Path::new("show/episode.mp4"));
+        assert_eq!(out, PathBuf::from("/out/show/episode.mkv"));
+    }
+}
