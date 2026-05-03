@@ -453,10 +453,10 @@ impl App {
     fn cancel_encode(&mut self) {
         if let Some(e) = &self.encoder {
             e.cancel.store(true, Ordering::Relaxed);
-            if let Ok(mut guard) = e.current_child.lock() {
-                if let Some(child) = guard.as_mut() {
-                    let _ = child.kill();
-                }
+            if let Ok(mut guard) = e.current_child.lock()
+                && let Some(child) = guard.as_mut()
+            {
+                let _ = child.kill();
             }
             self.log("encode: cancel requested");
         }
@@ -505,10 +505,10 @@ impl App {
                         needs_repaint = true;
                     }
                     Ok(EncodeMsg::Progress(idx, frac)) => {
-                        if let Some(f) = self.files.get_mut(idx) {
-                            if matches!(f.status, Status::Encoding(_)) {
-                                f.status = Status::Encoding(Some(frac));
-                            }
+                        if let Some(f) = self.files.get_mut(idx)
+                            && matches!(f.status, Status::Encoding(_))
+                        {
+                            f.status = Status::Encoding(Some(frac));
                         }
                         needs_repaint = true;
                     }
@@ -663,15 +663,15 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Source folder…").clicked() {
-                    if let Some(p) = self.pick_dir("source") {
-                        self.source = Some(p);
-                    }
+                if ui.button("Source folder…").clicked()
+                    && let Some(p) = self.pick_dir("source")
+                {
+                    self.source = Some(p);
                 }
-                if ui.button("Source file…").clicked() {
-                    if let Some(p) = self.pick_source_file() {
-                        self.source = Some(p);
-                    }
+                if ui.button("Source file…").clicked()
+                    && let Some(p) = self.pick_source_file()
+                {
+                    self.source = Some(p);
                 }
                 ui.label(
                     self.source
@@ -684,10 +684,10 @@ impl eframe::App for App {
                 );
             });
             ui.horizontal(|ui| {
-                if ui.button("Output…").clicked() {
-                    if let Some(p) = self.pick_dir("output") {
-                        self.output = Some(p);
-                    }
+                if ui.button("Output…").clicked()
+                    && let Some(p) = self.pick_dir("output")
+                {
+                    self.output = Some(p);
                 }
                 ui.label(
                     self.output
@@ -842,8 +842,10 @@ struct Summary {
 }
 
 fn summarize(files: &[FileEntry]) -> Summary {
-    let mut s = Summary::default();
-    s.total = files.len();
+    let mut s = Summary {
+        total: files.len(),
+        ..Default::default()
+    };
     for f in files {
         match (&f.decision, &f.status) {
             (_, Status::Done) => s.done += 1,
