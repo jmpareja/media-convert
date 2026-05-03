@@ -14,6 +14,49 @@ use media_convert::container::Container;
 use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
 use media_convert::{probe, scan};
 
+const HINT_SOURCE_FOLDER: &str =
+    "Pick a directory to scan for video files. The tree under it is mirrored under the output directory.";
+const HINT_SOURCE_FILE: &str =
+    "Pick a single video file. Output will use the same relative name with the chosen container extension.";
+const HINT_OUTPUT: &str =
+    "Pick where converted files are written. The source directory tree is mirrored under this path.";
+
+const HINT_CODEC: &str = "Target video codec for re-encoding.";
+const HINT_CODEC_X265: &str =
+    "HEVC / x265 — efficient compression with broad hardware decode support on modern devices.";
+const HINT_CODEC_AV1: &str =
+    "AV1 — better compression than x265, but software encoding is slow and decode hardware is newer / less universal.";
+
+const HINT_BACKEND: &str =
+    "Encoder backend. Software gives the smallest files; hardware backends are much faster but produce larger files at equivalent quality.";
+const HINT_BACKEND_SOFTWARE: &str =
+    "CPU encoders (libx265 / libsvtav1). Best compression, slowest. Works everywhere.";
+const HINT_BACKEND_NVENC: &str =
+    "NVIDIA NVENC (hevc_nvenc / av1_nvenc). Fast hardware encoding; requires an NVIDIA GPU with the matching codec capability.";
+const HINT_BACKEND_QSV: &str =
+    "Intel Quick Sync Video (hevc_qsv / av1_qsv). Requires an Intel iGPU.";
+const HINT_BACKEND_VAAPI: &str =
+    "VAAPI (Linux). Works with AMD and Intel iGPUs via /dev/dri/renderD128.";
+
+const HINT_CONTAINER: &str = "Output container format.";
+const HINT_CONTAINER_MKV: &str =
+    "Matroska — preserves all tracks (video, audio, subtitles, attachments). Best for archival and rich subtitle support.";
+const HINT_CONTAINER_MP4: &str =
+    "MP4 — universal playback. Subtitles are transcoded to mov_text; image-based subs (PGS/DVB) and attachments are dropped.";
+
+const HINT_QUALITY: &str =
+    "Quality value (lower = better quality, larger files). The flag and meaningful range depend on the backend: software/nvenc/qsv ~18-30, vaapi -qp ~20-30.";
+const HINT_PRESET: &str =
+    "Encoder preset. libx265: ultrafast..placebo. libsvtav1: 0-13 (lower = slower / better). nvenc: p1..p7. qsv: veryfast..veryslow. vaapi: ignored.";
+
+const HINT_FORCE: &str =
+    "Re-encode files even when their video stream is already in the target codec.";
+const HINT_RECURSE: &str = "Walk into subdirectories of the source folder when scanning.";
+const HINT_EMBED_SUBTITLES: &str =
+    "Auto-discover sidecar .srt files (e.g. movie.srt, movie.en.srt next to movie.mp4) and mux them into the output as subtitle tracks.";
+const HINT_SHOW_ONLY_ENCODE: &str =
+    "Hide files that are already in the target codec or where the output already exists.";
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -669,12 +712,18 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Source folder…").clicked()
+                if ui
+                    .button("Source folder…")
+                    .on_hover_text(HINT_SOURCE_FOLDER)
+                    .clicked()
                     && let Some(p) = self.pick_dir("source")
                 {
                     self.source = Some(p);
                 }
-                if ui.button("Source file…").clicked()
+                if ui
+                    .button("Source file…")
+                    .on_hover_text(HINT_SOURCE_FILE)
+                    .clicked()
                     && let Some(p) = self.pick_source_file()
                 {
                     self.source = Some(p);
@@ -690,7 +739,10 @@ impl eframe::App for App {
                 );
             });
             ui.horizontal(|ui| {
-                if ui.button("Output…").clicked()
+                if ui
+                    .button("Output…")
+                    .on_hover_text(HINT_OUTPUT)
+                    .clicked()
                     && let Some(p) = self.pick_dir("output")
                 {
                     self.output = Some(p);
@@ -703,54 +755,74 @@ impl eframe::App for App {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label("Codec:");
+                ui.label("Codec:").on_hover_text(HINT_CODEC);
                 let prev_codec = self.codec;
                 egui::ComboBox::from_id_salt("codec_combo")
                     .selected_text(self.codec.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.codec, Codec::X265, "x265");
-                        ui.selectable_value(&mut self.codec, Codec::Av1, "av1");
-                    });
+                        ui.selectable_value(&mut self.codec, Codec::X265, "x265")
+                            .on_hover_text(HINT_CODEC_X265);
+                        ui.selectable_value(&mut self.codec, Codec::Av1, "av1")
+                            .on_hover_text(HINT_CODEC_AV1);
+                    })
+                    .response
+                    .on_hover_text(HINT_CODEC);
                 ui.separator();
-                ui.label("Backend:");
+                ui.label("Backend:").on_hover_text(HINT_BACKEND);
                 let prev_backend = self.backend;
                 egui::ComboBox::from_id_salt("backend_combo")
                     .selected_text(self.backend.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.backend, Backend::Software, "software");
-                        ui.selectable_value(&mut self.backend, Backend::Nvenc, "nvenc");
-                        ui.selectable_value(&mut self.backend, Backend::Qsv, "qsv");
-                        ui.selectable_value(&mut self.backend, Backend::Vaapi, "vaapi");
-                    });
+                        ui.selectable_value(&mut self.backend, Backend::Software, "software")
+                            .on_hover_text(HINT_BACKEND_SOFTWARE);
+                        ui.selectable_value(&mut self.backend, Backend::Nvenc, "nvenc")
+                            .on_hover_text(HINT_BACKEND_NVENC);
+                        ui.selectable_value(&mut self.backend, Backend::Qsv, "qsv")
+                            .on_hover_text(HINT_BACKEND_QSV);
+                        ui.selectable_value(&mut self.backend, Backend::Vaapi, "vaapi")
+                            .on_hover_text(HINT_BACKEND_VAAPI);
+                    })
+                    .response
+                    .on_hover_text(HINT_BACKEND);
                 if self.codec != prev_codec || self.backend != prev_backend {
                     self.reset_to_backend_defaults();
                 }
                 ui.separator();
-                ui.label("Container:");
+                ui.label("Container:").on_hover_text(HINT_CONTAINER);
                 egui::ComboBox::from_id_salt("container_combo")
                     .selected_text(self.container.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.container, Container::Mkv, "mkv");
-                        ui.selectable_value(&mut self.container, Container::Mp4, "mp4");
-                    });
+                        ui.selectable_value(&mut self.container, Container::Mkv, "mkv")
+                            .on_hover_text(HINT_CONTAINER_MKV);
+                        ui.selectable_value(&mut self.container, Container::Mp4, "mp4")
+                            .on_hover_text(HINT_CONTAINER_MP4);
+                    })
+                    .response
+                    .on_hover_text(HINT_CONTAINER);
                 let cfg = self.backend.config(self.codec);
                 ui.separator();
-                ui.label(format!("{}:", cfg.quality_flag.trim_start_matches('-')));
-                ui.add(egui::Slider::new(&mut self.quality, 0..=63));
+                ui.label(format!("{}:", cfg.quality_flag.trim_start_matches('-')))
+                    .on_hover_text(HINT_QUALITY);
+                ui.add(egui::Slider::new(&mut self.quality, 0..=63))
+                    .on_hover_text(HINT_QUALITY);
                 ui.separator();
-                ui.label("Preset:");
+                ui.label("Preset:").on_hover_text(HINT_PRESET);
                 ui.add_enabled(
                     cfg.default_preset.is_some(),
                     egui::TextEdit::singleline(&mut self.preset).desired_width(80.0),
-                );
+                )
+                .on_hover_text(HINT_PRESET);
                 ui.separator();
-                ui.checkbox(&mut self.force, "Force re-encode");
+                ui.checkbox(&mut self.force, "Force re-encode")
+                    .on_hover_text(HINT_FORCE);
                 if self.source.as_deref().is_some_and(Path::is_dir) {
                     ui.separator();
-                    ui.checkbox(&mut self.recurse, "Recurse subdirectories");
+                    ui.checkbox(&mut self.recurse, "Recurse subdirectories")
+                        .on_hover_text(HINT_RECURSE);
                 }
                 ui.separator();
-                ui.checkbox(&mut self.embed_subtitles, "Embed sidecar SRT subtitles");
+                ui.checkbox(&mut self.embed_subtitles, "Embed sidecar SRT subtitles")
+                    .on_hover_text(HINT_EMBED_SUBTITLES);
             });
             ui.horizontal(|ui| {
                 let scanning = self.scanner.is_some();
@@ -777,7 +849,8 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
-                ui.checkbox(&mut self.selected_only_encode, "Show only to-encode");
+                ui.checkbox(&mut self.selected_only_encode, "Show only to-encode")
+                    .on_hover_text(HINT_SHOW_ONLY_ENCODE);
             });
             ui.add_space(4.0);
         });
