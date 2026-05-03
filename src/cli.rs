@@ -49,4 +49,9 @@ pub struct Cli {
     /// Do not descend into subdirectories when --source is a directory
     #[arg(long)]
     pub no_recurse: bool,
+
+    /// Auto-discover sidecar .srt files (e.g. movie.srt, movie.en.srt next to
+    /// movie.mp4) and mux them into the output as additional subtitle tracks.
+    #[arg(long)]
+    pub embed_subtitles: bool,
 }

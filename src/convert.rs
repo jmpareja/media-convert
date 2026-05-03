@@ -1,10 +1,16 @@
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use crate::backend::Backend;
 use crate::codec::Codec;
+
+#[derive(Clone, Debug)]
+pub struct SubtitleInput {
+    pub path: PathBuf,
+    pub language: Option<String>,
+}
 
 pub struct EncodeOptions<'a> {
     pub codec: Codec,
@@ -13,6 +19,12 @@ pub struct EncodeOptions<'a> {
     /// `None` means: use the backend default (or omit `-preset` entirely if
     /// the backend has no preset concept, e.g. VAAPI).
     pub preset: Option<&'a str>,
+    /// External subtitle files to mux into the output as additional tracks.
+    pub subtitles: &'a [SubtitleInput],
+    /// Number of subtitle streams already inside the source video; used to
+    /// compute output stream indices when tagging the language of the
+    /// sidecar SRTs we add.
+    pub source_subtitle_count: usize,
 }
 
 pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<Child> {
@@ -41,8 +53,14 @@ pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result
     }
 
     cmd.arg("-i").arg(input);
+    for sub in opts.subtitles {
+        cmd.arg("-i").arg(&sub.path);
+    }
 
     cmd.args(["-map", "0"]);
+    for i in 0..opts.subtitles.len() {
+        cmd.arg("-map").arg(format!("{}", i + 1));
+    }
 
     if let Some(filter) = &cfg.video_filter {
         cmd.args(["-vf", filter]);
@@ -62,6 +80,14 @@ pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result
     cmd.args([
         "-c:a", "copy", "-c:s", "copy", "-c:d", "copy", "-c:t", "copy",
     ]);
+
+    for (i, sub) in opts.subtitles.iter().enumerate() {
+        if let Some(lang) = &sub.language {
+            let stream_idx = opts.source_subtitle_count + i;
+            cmd.arg(format!("-metadata:s:s:{stream_idx}"))
+                .arg(format!("language={lang}"));
+        }
+    }
 
     cmd.arg(output);
 

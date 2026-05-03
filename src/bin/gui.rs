@@ -10,7 +10,7 @@ use egui_extras::{Column, TableBuilder};
 
 use media_convert::backend::Backend;
 use media_convert::codec::Codec;
-use media_convert::convert::{EncodeOptions, read_progress, spawn_encode};
+use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
 use media_convert::{probe, scan};
 
 fn main() -> eframe::Result<()> {
@@ -50,6 +50,7 @@ struct FileEntry {
     output: PathBuf,
     source_codec: Option<String>,
     duration_secs: Option<f64>,
+    source_subtitle_count: usize,
     decision: Decision,
     status: Status,
 }
@@ -99,6 +100,7 @@ struct App {
     preset: String,
     force: bool,
     recurse: bool,
+    embed_subtitles: bool,
 
     files: Vec<FileEntry>,
 
@@ -125,6 +127,7 @@ impl Default for App {
             preset: cfg.default_preset.unwrap_or("").to_string(),
             force: false,
             recurse: true,
+            embed_subtitles: false,
             files: Vec::new(),
             scanner: None,
             encoder: None,
@@ -296,27 +299,33 @@ impl App {
                 let mut out = output.join(&rel);
                 out.set_extension("mkv");
 
-                let (source_codec, duration_secs, decision) = if out.exists() {
-                    (None, None, Decision::SkipOutputExists)
-                } else {
-                    match probe::video_info(abs) {
-                        Ok(info) => {
-                            let dec = if force || !codec.matches_source(&info.codec) {
-                                Decision::Encode
-                            } else {
-                                Decision::SkipAlreadyTarget
-                            };
-                            (Some(info.codec), info.duration_secs, dec)
+                let (source_codec, duration_secs, source_subtitle_count, decision) =
+                    if out.exists() {
+                        (None, None, 0, Decision::SkipOutputExists)
+                    } else {
+                        match probe::video_info(abs) {
+                            Ok(info) => {
+                                let dec = if force || !codec.matches_source(&info.codec) {
+                                    Decision::Encode
+                                } else {
+                                    Decision::SkipAlreadyTarget
+                                };
+                                (
+                                    Some(info.codec),
+                                    info.duration_secs,
+                                    info.subtitle_count,
+                                    dec,
+                                )
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ScanMsg::Error(format!(
+                                    "probe failed for {}: {e:#}",
+                                    rel.display()
+                                )));
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            let _ = tx.send(ScanMsg::Error(format!(
-                                "probe failed for {}: {e:#}",
-                                rel.display()
-                            )));
-                            continue;
-                        }
-                    }
-                };
+                    };
 
                 let entry = FileEntry {
                     abs: abs.clone(),
@@ -324,6 +333,7 @@ impl App {
                     output: out,
                     source_codec,
                     duration_secs,
+                    source_subtitle_count,
                     decision,
                     status: Status::Pending,
                 };
@@ -350,13 +360,27 @@ impl App {
             self.notify_warning("Encode is already running.");
             return;
         }
-        let jobs: Vec<(usize, FileEntry)> = self
+        let embed_subtitles = self.embed_subtitles;
+        let jobs: Vec<(usize, FileEntry, Vec<SubtitleInput>)> = self
             .files
             .iter()
             .enumerate()
             .filter(|(_, f)| matches!(f.decision, Decision::Encode))
             .filter(|(_, f)| !matches!(f.status, Status::Done))
-            .map(|(i, f)| (i, f.clone()))
+            .map(|(i, f)| {
+                let subs = if embed_subtitles {
+                    media_convert::scan::discover_subtitles(&f.abs)
+                        .into_iter()
+                        .map(|s| SubtitleInput {
+                            path: s.path,
+                            language: s.language,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (i, f.clone(), subs)
+            })
             .collect();
 
         if jobs.is_empty() {
@@ -380,20 +404,22 @@ impl App {
             } else {
                 Some(preset.as_str())
             };
-            let opts = EncodeOptions {
-                codec,
-                backend,
-                quality,
-                preset: preset_opt,
-            };
 
-            for (idx, entry) in jobs {
+            for (idx, entry, subs) in jobs {
                 if cancel_thread.load(Ordering::Relaxed) {
                     break;
                 }
                 if tx.send(EncodeMsg::Started(idx)).is_err() {
                     break;
                 }
+                let opts = EncodeOptions {
+                    codec,
+                    backend,
+                    quality,
+                    preset: preset_opt,
+                    subtitles: &subs,
+                    source_subtitle_count: entry.source_subtitle_count,
+                };
                 let result = run_one(
                     &entry.abs,
                     &entry.output,
@@ -709,6 +735,8 @@ impl eframe::App for App {
                     ui.separator();
                     ui.checkbox(&mut self.recurse, "Recurse subdirectories");
                 }
+                ui.separator();
+                ui.checkbox(&mut self.embed_subtitles, "Embed sidecar SRT subtitles");
             });
             ui.horizontal(|ui| {
                 let scanning = self.scanner.is_some();
