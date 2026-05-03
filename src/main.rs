@@ -37,12 +37,8 @@ fn main() -> Result<()> {
 
     let cfg = args.backend.config(args.codec);
     let preset_owned = args.preset.clone();
-    let opts = EncodeOptions {
-        codec: args.codec,
-        backend: args.backend,
-        quality: args.quality.unwrap_or(cfg.default_quality),
-        preset: preset_owned.as_deref().or(cfg.default_preset),
-    };
+    let quality = args.quality.unwrap_or(cfg.default_quality);
+    let preset = preset_owned.as_deref().or(cfg.default_preset);
 
     let mut converted = 0u64;
     let mut skipped = 0u64;
@@ -86,7 +82,36 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let duration = probe::video_info(input).ok().and_then(|i| i.duration_secs);
+        let info = probe::video_info(input).ok();
+        let duration = info.as_ref().and_then(|i| i.duration_secs);
+        let source_subtitle_count = info.as_ref().map(|i| i.subtitle_count).unwrap_or(0);
+
+        let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles {
+            scan::discover_subtitles(input)
+                .into_iter()
+                .map(|s| convert::SubtitleInput {
+                    path: s.path,
+                    language: s.language,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !subtitles.is_empty() {
+            println!(
+                "{prefix} found {} sidecar subtitle file(s)",
+                subtitles.len()
+            );
+        }
+
+        let opts = EncodeOptions {
+            codec: args.codec,
+            backend: args.backend,
+            quality,
+            preset,
+            subtitles: &subtitles,
+            source_subtitle_count,
+        };
 
         let rel_str = rel.display().to_string();
         let tty = io::stdout().is_terminal();

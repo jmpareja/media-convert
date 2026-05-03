@@ -5,6 +5,67 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "m2ts",
 ];
 
+#[derive(Clone, Debug)]
+pub struct SidecarSubtitle {
+    pub path: PathBuf,
+    pub language: Option<String>,
+}
+
+/// Find sidecar `.srt` files next to `video`. A sidecar is a file in the same
+/// directory whose stem either matches the video stem exactly (e.g.
+/// `movie.srt` next to `movie.mp4`) or starts with `<stem>.` (e.g.
+/// `movie.en.srt`, `movie.eng.srt`). When a 2- or 3-letter ASCII language
+/// code follows the stem, it's returned as `language`.
+pub fn discover_subtitles(video: &Path) -> Vec<SidecarSubtitle> {
+    let Some(stem) = video.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let parent = match video.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_srt = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("srt"))
+            .unwrap_or(false);
+        if !is_srt {
+            continue;
+        }
+        let Some(srt_stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if srt_stem == stem {
+            out.push(SidecarSubtitle {
+                path,
+                language: None,
+            });
+        } else if let Some(suffix) = srt_stem.strip_prefix(&format!("{stem}.")) {
+            let first = suffix.split('.').next().unwrap_or("");
+            let language = if (first.len() == 2 || first.len() == 3)
+                && first.chars().all(|c| c.is_ascii_alphabetic())
+            {
+                Some(first.to_lowercase())
+            } else {
+                None
+            };
+            out.push(SidecarSubtitle { path, language });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
 pub fn find_videos(root: &Path, recursive: bool) -> Vec<PathBuf> {
     if root.is_file() {
         return if is_video(root) {
@@ -91,6 +152,49 @@ mod tests {
         assert!(videos.iter().any(|p| p.ends_with("a.mp4")));
         assert!(videos.iter().any(|p| p.ends_with("nested/b.mkv")));
         assert!(videos.iter().any(|p| p.ends_with("nested/c.MOV")));
+    }
+
+    #[test]
+    fn discover_subtitles_finds_basename_match_and_lang_codes() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("show.S01E01.mp4");
+        fs::write(&video, b"").unwrap();
+        fs::write(dir.path().join("show.S01E01.srt"), b"").unwrap();
+        fs::write(dir.path().join("show.S01E01.en.srt"), b"").unwrap();
+        fs::write(dir.path().join("show.S01E01.ger.srt"), b"").unwrap();
+        // Should be ignored: not a sidecar of this video
+        fs::write(dir.path().join("other.srt"), b"").unwrap();
+        // Should be ignored: not an SRT
+        fs::write(dir.path().join("show.S01E01.txt"), b"").unwrap();
+
+        let subs = discover_subtitles(&video);
+        assert_eq!(subs.len(), 3);
+
+        let by_path: Vec<_> = subs
+            .iter()
+            .map(|s| {
+                (
+                    s.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    s.language.clone(),
+                )
+            })
+            .collect();
+        assert!(by_path.contains(&("show.S01E01.srt".into(), None)));
+        assert!(by_path.contains(&("show.S01E01.en.srt".into(), Some("en".into()))));
+        assert!(by_path.contains(&("show.S01E01.ger.srt".into(), Some("ger".into()))));
+    }
+
+    #[test]
+    fn discover_subtitles_skips_non_lang_suffix() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("movie.mkv");
+        fs::write(&video, b"").unwrap();
+        // "forced" is 6 chars — not a language code; language stays None
+        fs::write(dir.path().join("movie.forced.srt"), b"").unwrap();
+
+        let subs = discover_subtitles(&video);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].language, None);
     }
 
     #[test]
