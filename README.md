@@ -6,12 +6,70 @@ encoding (best compression) and three hardware backends.
 
 ## Requirements
 
-- `ffmpeg` and `ffprobe` on `PATH` (build with the encoders you intend to use:
+- `ffmpeg` and `ffprobe` on `PATH`, built with the encoders you intend to use:
   `libx265`, `libsvtav1`, and any of `hevc_nvenc`/`av1_nvenc`,
-  `hevc_qsv`/`av1_qsv`, `hevc_vaapi`/`av1_vaapi`).
+  `hevc_qsv`/`av1_qsv`, `hevc_vaapi`/`av1_vaapi`.
 - Rust toolchain (stable, edition 2024).
+- Vendor driver for hardware backends (see [Hardware backend prerequisites](#hardware-backend-prerequisites)).
 
-## Install
+### Install ffmpeg
+
+Most distro packages of ffmpeg already include `libx265`, `libsvtav1`, NVENC,
+QSV and VAAPI support — you just need the right vendor driver loaded.
+
+**Debian / Ubuntu**
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
+
+**Fedora / RHEL** (RPM Fusion provides the full-featured build)
+```bash
+sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
+sudo dnf install ffmpeg
+```
+
+**Arch / Manjaro**
+```bash
+sudo pacman -S ffmpeg
+```
+
+**macOS** (Homebrew — NVENC/QSV/VAAPI not applicable)
+```bash
+brew install ffmpeg
+```
+
+Verify the encoders you want are present:
+```bash
+ffmpeg -hide_banner -encoders | grep -E 'x265|svtav1|nvenc|qsv|vaapi'
+```
+
+### Install Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+(or use your distro's `rustup` package, e.g. `sudo apt install rustup`).
+
+### Hardware backend prerequisites
+
+You only need the driver for the backend you plan to use.
+
+- **NVENC** — install NVIDIA's proprietary driver (`nvidia-driver` on
+  Debian/Ubuntu, `akmod-nvidia` on Fedora, `nvidia` on Arch). Verify with
+  `nvidia-smi`. AV1 NVENC requires an RTX 40-series GPU or newer.
+- **QSV** (Intel iGPU) — install the Intel media driver:
+  ```bash
+  sudo apt install intel-media-va-driver-non-free   # Debian/Ubuntu
+  sudo dnf install intel-media-driver                # Fedora
+  sudo pacman -S intel-media-driver                  # Arch
+  ```
+  AV1 QSV requires Arc / Xe / 11th-gen Intel or newer.
+- **VAAPI** — for AMD: `mesa-va-drivers` (Debian/Ubuntu) or `mesa-vdpau-drivers`/
+  `libva-mesa-driver` (Fedora/Arch). For Intel, the QSV driver above also
+  provides VAAPI. Verify with `vainfo` (in `vainfo` / `libva-utils`).
+
+## Install media-convert
 
 ```bash
 ./install.sh
