@@ -45,4 +45,8 @@ pub struct Cli {
     /// Re-encode even if the source video stream is already in the target codec
     #[arg(long)]
     pub force: bool,
+
+    /// Do not descend into subdirectories when --source is a directory
+    #[arg(long)]
+    pub no_recurse: bool,
 }
