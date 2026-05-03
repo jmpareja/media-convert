@@ -82,18 +82,20 @@ Builds and installs `media-convert` and `media-convert-gui` to
 ## CLI
 
 ```bash
-media-convert --source ./in --output ./out [options]
+media-convert --source ./in [--output ./out] [options]
 ```
 
 `--source` accepts either a directory (scanned for video files) or a single
-video file.
+video file. `--output` is optional — if omitted, it defaults to a sibling
+of the source directory named `<source>-converted` (for a file source, the
+file's parent directory is used as the basis).
 
 Common flags:
 
 | Flag | Purpose |
 |---|---|
 | `-s, --source <path>` | Source directory or single video file |
-| `-o, --output <path>` | Output directory (mirrors the source tree) |
+| `-o, --output <path>` | Output directory (default: `<source>-converted` sibling) |
 | `-c, --codec <x265\|av1>` | Target codec (default `x265`) |
 | `-b, --backend <software\|nvenc\|qsv\|vaapi>` | Encoder backend (default `software`) |
 | `--container <mkv\|mp4>` | Output container (default `mkv`) |
@@ -109,6 +111,9 @@ While encoding, the CLI prints a redrawn `[i/N] NN% file.<ext>` line per file.
 ### Examples
 
 ```bash
+# Default output: ~/Videos-converted (sibling of the source)
+media-convert -s ~/Videos
+
 # Re-encode a library to HEVC/MKV, software (best compression)
 media-convert -s ~/Videos -o ~/Videos-x265
 
@@ -131,11 +136,12 @@ media-convert -s ~/Videos -o ~/Videos-x265 --dry-run
 media-convert-gui
 ```
 
-Pick a source (folder or single file) and an output directory, configure
-codec / backend / container / quality, **Scan**, then **Convert**. The Status
-column shows live `encoding NN%` per file. Toggle "Embed sidecar SRT
-subtitles" to mux any `movie.srt` / `movie.en.srt`-style files alongside each
-source.
+Pick a source (folder or single file) — the output directory is auto-filled
+to `<source>-converted` and is editable. Configure codec / backend /
+container / quality, **Scan**, then **Convert**. Hover any control to see a
+tooltip explaining what the option does. The Status column shows live
+`encoding NN%` per file. Toggle "Embed sidecar SRT subtitles" to mux any
+`movie.srt` / `movie.en.srt`-style files alongside each source.
 
 ## Backends
 
@@ -179,6 +185,21 @@ extension determined by `--container`:
 Files whose video stream already matches the target codec are skipped unless
 `--force` is passed. Files whose output already exists are skipped
 unconditionally — delete the output and re-run to redo a single file.
+
+### Output validation
+
+Before encoding, `media-convert` checks the output directory:
+
+- **Errors** (abort): the path exists but isn't a directory, the directory
+  can't be created, or it isn't writable. Writability is probed by creating
+  and removing a unique temporary file.
+- **Warnings** (continue): the source's total on-disk size exceeds the free
+  space on the output filesystem. Re-encoding usually shrinks files, but
+  this catches the case where the conversion might run out of room.
+
+The CLI prints warnings to stderr and bails on errors. The GUI shows them in
+a modal — the writability check runs at **Scan** time and the disk-space
+check runs at **Convert** time once the file list is known.
 
 ## Subtitle handling
 
