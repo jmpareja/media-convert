@@ -395,6 +395,27 @@ mod tests {
     }
 
     #[test]
+    fn nvenc_routes_decode_through_cuda_before_input() {
+        // -hwaccel applies to the next -i, so it must appear before the main
+        // input. Verify both flags are present and ordered correctly.
+        let mut opts = opts_software_x265();
+        opts.backend = Backend::Nvenc;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        let hw_idx = args
+            .iter()
+            .position(|a| a == "-hwaccel")
+            .expect("has -hwaccel");
+        let input_idx = args.iter().position(|a| a == "-i").expect("has -i");
+        assert!(hw_idx < input_idx, "-hwaccel must precede -i");
+        assert_eq!(args[hw_idx + 1], "cuda");
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-hwaccel_output_format", "cuda"])
+        );
+    }
+
+    #[test]
     fn explicit_preset_overrides_backend_default() {
         let mut opts = opts_software_x265();
         opts.preset = Some("slow");

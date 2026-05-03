@@ -33,6 +33,19 @@ pub struct EncoderConfig {
     pub video_filter: Option<String>,
 }
 
+/// Per-input options that route H.264/HEVC/AV1 decoding through NVDEC and
+/// keep the decoded frames in CUDA memory, so they hand off to NVENC without
+/// a round-trip through system RAM. Used as the preamble for both NVENC
+/// configs.
+fn nvenc_cuda_preamble() -> Vec<String> {
+    vec![
+        "-hwaccel".into(),
+        "cuda".into(),
+        "-hwaccel_output_format".into(),
+        "cuda".into(),
+    ]
+}
+
 impl Backend {
     pub fn label(self) -> &'static str {
         match self {
@@ -69,7 +82,7 @@ impl Backend {
                 quality_flag: "-cq",
                 default_quality: 23,
                 default_preset: Some("p4"),
-                preamble: vec![],
+                preamble: nvenc_cuda_preamble(),
                 extra_post: vec!["-rc".into(), "vbr".into()],
                 video_filter: None,
             },
@@ -78,7 +91,7 @@ impl Backend {
                 quality_flag: "-cq",
                 default_quality: 28,
                 default_preset: Some("p4"),
-                preamble: vec![],
+                preamble: nvenc_cuda_preamble(),
                 extra_post: vec!["-rc".into(), "vbr".into()],
                 video_filter: None,
             },
@@ -177,6 +190,22 @@ mod tests {
         let cfg = Backend::Nvenc.config(Codec::Av1);
         assert_eq!(cfg.encoder, "av1_nvenc");
         assert_eq!(cfg.default_quality, 28);
+    }
+
+    #[test]
+    fn nvenc_routes_decode_through_cuda() {
+        // Both NVENC configs (x265 + av1) must request `-hwaccel cuda` plus
+        // `-hwaccel_output_format cuda` so the decode path runs on NVDEC and
+        // the decoded frames stay in GPU memory all the way to NVENC instead
+        // of bouncing through system RAM.
+        let expected = vec![
+            "-hwaccel".to_string(),
+            "cuda".to_string(),
+            "-hwaccel_output_format".to_string(),
+            "cuda".to_string(),
+        ];
+        assert_eq!(Backend::Nvenc.config(Codec::X265).preamble, expected);
+        assert_eq!(Backend::Nvenc.config(Codec::Av1).preamble, expected);
     }
 
     #[test]
