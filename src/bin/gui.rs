@@ -806,9 +806,11 @@ impl eframe::App for App {
                         .unwrap_or_else(|| "(none)".into()),
                 );
             });
+            // Row 1: encoder settings (codec / backend / container / quality / preset)
+            let prev_codec = self.codec;
+            let prev_backend = self.backend;
             ui.horizontal(|ui| {
                 ui.label("Codec:").on_hover_text(HINT_CODEC);
-                let prev_codec = self.codec;
                 egui::ComboBox::from_id_salt("codec_combo")
                     .selected_text(self.codec.label())
                     .show_ui(ui, |ui| {
@@ -821,7 +823,6 @@ impl eframe::App for App {
                     .on_hover_text(HINT_CODEC);
                 ui.separator();
                 ui.label("Backend:").on_hover_text(HINT_BACKEND);
-                let prev_backend = self.backend;
                 egui::ComboBox::from_id_salt("backend_combo")
                     .selected_text(self.backend.label())
                     .show_ui(ui, |ui| {
@@ -836,9 +837,6 @@ impl eframe::App for App {
                     })
                     .response
                     .on_hover_text(HINT_BACKEND);
-                if self.codec != prev_codec || self.backend != prev_backend {
-                    self.reset_to_backend_defaults();
-                }
                 ui.separator();
                 ui.label("Container:").on_hover_text(HINT_CONTAINER);
                 egui::ComboBox::from_id_salt("container_combo")
@@ -864,7 +862,12 @@ impl eframe::App for App {
                     egui::TextEdit::singleline(&mut self.preset).desired_width(80.0),
                 )
                 .on_hover_text(HINT_PRESET);
-                ui.separator();
+            });
+            if self.codec != prev_codec || self.backend != prev_backend {
+                self.reset_to_backend_defaults();
+            }
+            // Row 2: behavior toggles
+            ui.horizontal(|ui| {
                 ui.checkbox(&mut self.force, "Force re-encode")
                     .on_hover_text(HINT_FORCE);
                 if self.source.as_deref().is_some_and(Path::is_dir) {
