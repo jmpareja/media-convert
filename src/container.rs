@@ -26,3 +26,25 @@ impl Container {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_matches_format_name() {
+        assert_eq!(Container::Mkv.extension(), "mkv");
+        assert_eq!(Container::Mp4.extension(), "mp4");
+    }
+
+    #[test]
+    fn label_matches_format_name() {
+        assert_eq!(Container::Mkv.label(), "mkv");
+        assert_eq!(Container::Mp4.label(), "mp4");
+    }
+
+    #[test]
+    fn default_is_mkv() {
+        assert_eq!(Container::default(), Container::Mkv);
+    }
+}
