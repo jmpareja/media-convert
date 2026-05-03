@@ -23,3 +23,37 @@ impl Codec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_returns_lowercase_short_name() {
+        assert_eq!(Codec::X265.label(), "x265");
+        assert_eq!(Codec::Av1.label(), "av1");
+    }
+
+    #[test]
+    fn x265_matches_hevc_and_h265_case_insensitively() {
+        assert!(Codec::X265.matches_source("hevc"));
+        assert!(Codec::X265.matches_source("HEVC"));
+        assert!(Codec::X265.matches_source("h265"));
+        assert!(Codec::X265.matches_source("H265"));
+    }
+
+    #[test]
+    fn x265_does_not_match_av1_or_h264() {
+        assert!(!Codec::X265.matches_source("av1"));
+        assert!(!Codec::X265.matches_source("h264"));
+        assert!(!Codec::X265.matches_source("vp9"));
+    }
+
+    #[test]
+    fn av1_matches_only_av1_case_insensitively() {
+        assert!(Codec::Av1.matches_source("av1"));
+        assert!(Codec::Av1.matches_source("AV1"));
+        assert!(!Codec::Av1.matches_source("hevc"));
+        assert!(!Codec::Av1.matches_source("h264"));
+    }
+}

@@ -123,3 +123,97 @@ impl Backend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_returns_lowercase_short_name() {
+        assert_eq!(Backend::Software.label(), "software");
+        assert_eq!(Backend::Nvenc.label(), "nvenc");
+        assert_eq!(Backend::Qsv.label(), "qsv");
+        assert_eq!(Backend::Vaapi.label(), "vaapi");
+    }
+
+    #[test]
+    fn default_backend_is_software() {
+        assert_eq!(Backend::default(), Backend::Software);
+    }
+
+    #[test]
+    fn software_x265_uses_libx265_with_crf_and_medium_preset() {
+        let cfg = Backend::Software.config(Codec::X265);
+        assert_eq!(cfg.encoder, "libx265");
+        assert_eq!(cfg.quality_flag, "-crf");
+        assert_eq!(cfg.default_quality, 23);
+        assert_eq!(cfg.default_preset, Some("medium"));
+        assert!(cfg.preamble.is_empty());
+        assert!(cfg.extra_post.is_empty());
+        assert!(cfg.video_filter.is_none());
+    }
+
+    #[test]
+    fn software_av1_uses_libsvtav1_with_crf_and_preset_eight() {
+        let cfg = Backend::Software.config(Codec::Av1);
+        assert_eq!(cfg.encoder, "libsvtav1");
+        assert_eq!(cfg.quality_flag, "-crf");
+        assert_eq!(cfg.default_quality, 30);
+        assert_eq!(cfg.default_preset, Some("8"));
+    }
+
+    #[test]
+    fn nvenc_x265_uses_hevc_nvenc_with_cq_and_vbr_rc() {
+        let cfg = Backend::Nvenc.config(Codec::X265);
+        assert_eq!(cfg.encoder, "hevc_nvenc");
+        assert_eq!(cfg.quality_flag, "-cq");
+        assert_eq!(cfg.default_preset, Some("p4"));
+        // CQ rate control needs `-rc vbr` to take effect
+        assert_eq!(cfg.extra_post, vec!["-rc".to_string(), "vbr".to_string()]);
+    }
+
+    #[test]
+    fn nvenc_av1_uses_av1_nvenc() {
+        let cfg = Backend::Nvenc.config(Codec::Av1);
+        assert_eq!(cfg.encoder, "av1_nvenc");
+        assert_eq!(cfg.default_quality, 28);
+    }
+
+    #[test]
+    fn qsv_uses_global_quality_flag() {
+        assert_eq!(
+            Backend::Qsv.config(Codec::X265).quality_flag,
+            "-global_quality"
+        );
+        assert_eq!(
+            Backend::Qsv.config(Codec::Av1).quality_flag,
+            "-global_quality"
+        );
+        assert_eq!(Backend::Qsv.config(Codec::X265).encoder, "hevc_qsv");
+        assert_eq!(Backend::Qsv.config(Codec::Av1).encoder, "av1_qsv");
+    }
+
+    #[test]
+    fn vaapi_x265_initialises_device_and_uploads_via_filter() {
+        let cfg = Backend::Vaapi.config(Codec::X265);
+        assert_eq!(cfg.encoder, "hevc_vaapi");
+        assert_eq!(cfg.quality_flag, "-qp");
+        // No preset concept on VAAPI
+        assert_eq!(cfg.default_preset, None);
+        assert_eq!(
+            cfg.preamble,
+            vec![
+                "-vaapi_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+            ]
+        );
+        assert_eq!(cfg.video_filter.as_deref(), Some("format=nv12,hwupload"));
+    }
+
+    #[test]
+    fn vaapi_av1_uses_av1_vaapi() {
+        let cfg = Backend::Vaapi.config(Codec::Av1);
+        assert_eq!(cfg.encoder, "av1_vaapi");
+        assert_eq!(cfg.default_preset, None);
+    }
+}

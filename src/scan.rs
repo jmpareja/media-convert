@@ -209,4 +209,69 @@ mod tests {
         assert_eq!(videos.len(), 1);
         assert!(videos[0].ends_with("a.mp4"));
     }
+
+    #[test]
+    fn find_videos_for_nonexistent_path_returns_empty() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(find_videos(&missing, true).is_empty());
+    }
+
+    #[test]
+    fn discover_subtitles_returns_results_sorted_by_path() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("show.mp4");
+        fs::write(&video, b"").unwrap();
+        // Write in non-alphabetical order; result must be alphabetical
+        fs::write(dir.path().join("show.fr.srt"), b"").unwrap();
+        fs::write(dir.path().join("show.en.srt"), b"").unwrap();
+        fs::write(dir.path().join("show.de.srt"), b"").unwrap();
+
+        let subs = discover_subtitles(&video);
+        let names: Vec<_> = subs
+            .iter()
+            .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["show.de.srt", "show.en.srt", "show.fr.srt"]
+        );
+    }
+
+    #[test]
+    fn discover_subtitles_accepts_uppercase_extension() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("clip.mkv");
+        fs::write(&video, b"").unwrap();
+        fs::write(dir.path().join("clip.SRT"), b"").unwrap();
+
+        let subs = discover_subtitles(&video);
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[test]
+    fn discover_subtitles_ignores_unrelated_videos() {
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("movie.mp4");
+        fs::write(&video, b"").unwrap();
+        // Sidecar of a different video should not be picked up
+        fs::write(dir.path().join("other.en.srt"), b"").unwrap();
+
+        let subs = discover_subtitles(&video);
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn discover_subtitles_returns_empty_for_video_without_stem() {
+        // Edge case: a path like "/" or with no file_stem returns empty rather
+        // than panicking.
+        let subs = discover_subtitles(Path::new("/"));
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn is_video_returns_false_for_path_without_extension() {
+        assert!(!is_video(Path::new("README")));
+        assert!(!is_video(Path::new("/some/path/file")));
+    }
 }
