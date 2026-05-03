@@ -12,6 +12,9 @@ and optional embedding of sidecar `.srt` subtitle files.
   `hevc_qsv`/`av1_qsv`, `hevc_vaapi`/`av1_vaapi`.
 - Rust toolchain (stable, edition 2024).
 - Vendor driver for hardware backends (see [Hardware backend prerequisites](#hardware-backend-prerequisites)).
+- Optional: `systemd-inhibit` (part of `systemd`, present on most modern Linux
+  distros) — used to block the screensaver and system suspend during encoding.
+  If it's missing, encoding still works; the screensaver just isn't blocked.
 
 ### Install ffmpeg
 
@@ -200,6 +203,17 @@ Before encoding, `media-convert` checks the output directory:
 The CLI prints warnings to stderr and bails on errors. The GUI shows them in
 a modal — the writability check runs at **Scan** time and the disk-space
 check runs at **Convert** time once the file list is known.
+
+## Screensaver and system sleep
+
+While an encode batch is in progress, both the CLI and GUI hold an inhibitor
+lock via `systemd-inhibit --what=idle:sleep`. This blocks the screensaver from
+kicking in and prevents the system from auto-suspending mid-encode. The lock is
+released as soon as the batch finishes (or is canceled, or the process exits).
+`shutdown` and the lid switch are intentionally **not** inhibited.
+
+If `systemd-inhibit` isn't on `PATH` (non-systemd system), the inhibitor is a
+silent no-op and encoding continues normally.
 
 ## Subtitle handling
 
