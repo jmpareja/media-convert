@@ -105,6 +105,7 @@ Common flags:
 | `--quality <N>` | CRF/CQ/QP value (0-63); backend-aware default |
 | `--preset <name>` | Encoder preset; backend-aware default |
 | `--embed-subtitles` | Mux sidecar `.srt` files next to each source into the output |
+| `--merge-subtitles` | Stream-copy each video and merge sidecar `.srt` files in (no re-encode); skip files with no sidecars |
 | `--no-recurse` | Don't descend into subdirectories of `--source` |
 | `--dry-run` | Scan and report what would be converted |
 | `--force` | Re-encode even if source already matches target |
@@ -128,6 +129,9 @@ media-convert -s ./episode.mkv -o ./out --container mp4
 
 # Embed any movie.en.srt / movie.ger.srt sidecars next to each input
 media-convert -s ~/Videos -o ~/Videos-x265 --embed-subtitles
+
+# Merge sidecar SRTs into existing files without re-encoding the video
+media-convert -s ~/Videos -o ~/Videos-merged --merge-subtitles
 
 # Preview only — no encoding
 media-convert -s ~/Videos -o ~/Videos-x265 --dry-run
@@ -227,6 +231,17 @@ extra tracks. The discovery rules:
 - Or whose stem starts with `<video-stem>.<lang>`, e.g. `movie.en.srt`,
   `movie.ger.srt`. Two- or three-letter ASCII codes are tagged as the
   subtitle's `language` metadata.
+
+### Merge subtitles without re-encoding
+
+`--merge-subtitles` flips the tool into a remux mode: video and audio are
+stream-copied (`-c:v copy -c:a copy`) and any discovered sidecar `.srt`
+files are muxed in as new subtitle tracks. This is dramatically faster
+than re-encoding and lossless — useful when you just want to attach
+subtitles to an existing library without changing codecs. Files without
+sidecar SRTs are skipped (there'd be nothing to merge). The codec /
+backend / quality / preset flags are ignored in this mode. The same
+checkbox is available in the GUI.
 
 ## License
 

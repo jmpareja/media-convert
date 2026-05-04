@@ -14,6 +14,7 @@ use media_convert::container::Container;
 use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
 use media_convert::inhibit::Inhibitor;
 use media_convert::output::{sum_file_sizes, validate_output};
+use media_convert::scan::SidecarSubtitle;
 use media_convert::{probe, scan};
 
 const HINT_SOURCE_FOLDER: &str = "Pick a directory to scan for video files. The tree under it is mirrored under the output directory.";
@@ -45,6 +46,7 @@ const HINT_FORCE: &str =
     "Re-encode files even when their video stream is already in the target codec.";
 const HINT_RECURSE: &str = "Walk into subdirectories of the source folder when scanning.";
 const HINT_EMBED_SUBTITLES: &str = "Auto-discover sidecar .srt files (e.g. movie.srt, movie.en.srt next to movie.mp4) and mux them into the output as subtitle tracks.";
+const HINT_MERGE_SUBTITLES: &str = "Skip re-encoding entirely — just stream-copy each video and mux in any sidecar .srt files. Files with no sidecar SRTs are skipped. Codec / quality / preset settings are ignored in this mode.";
 
 // Status palette — muted, JetBrains/VSCode-leaning accents. Saturated primary
 // colors compete with the rest of the UI; these read calmer at a glance.
@@ -86,6 +88,7 @@ enum Decision {
     Encode,
     SkipAlreadyTarget,
     SkipOutputExists,
+    SkipNoSubtitles,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +153,10 @@ struct FileEntry {
     duration_secs: Option<f64>,
     source_subtitle_codecs: Vec<String>,
     unmappable_stream_indices: Vec<usize>,
+    /// Sidecar SRTs discovered at scan time. Only populated when merge mode
+    /// is on (so we can drive the SkipNoSubtitles decision); in normal
+    /// encode mode this stays empty and discovery happens at encode start.
+    discovered_subtitles: Vec<SidecarSubtitle>,
     decision: Decision,
     status: Status,
 }
@@ -201,6 +208,7 @@ struct App {
     force: bool,
     recurse: bool,
     embed_subtitles: bool,
+    merge_subtitles: bool,
     show_advanced: bool,
 
     files: Vec<FileEntry>,
@@ -235,6 +243,7 @@ impl Default for App {
             force: false,
             recurse: true,
             embed_subtitles: false,
+            merge_subtitles: false,
             show_advanced: false,
             files: Vec::new(),
             scanner: None,
@@ -513,6 +522,7 @@ impl App {
         let container = self.container;
         let force = self.force;
         let recurse = self.recurse;
+        let merge_subtitles = self.merge_subtitles;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = cancel.clone();
         let (tx, rx) = channel();
@@ -558,6 +568,7 @@ impl App {
                         duration_secs,
                         source_subtitle_codecs,
                         unmappable_stream_indices,
+                        discovered_subtitles,
                         decision,
                     ) = if out.exists() {
                         (
@@ -568,12 +579,29 @@ impl App {
                             None,
                             Vec::new(),
                             Vec::new(),
+                            Vec::new(),
                             Decision::SkipOutputExists,
                         )
                     } else {
                         match probe::video_info(abs) {
                             Ok(info) => {
-                                let dec = if force || !codec.matches_source(&info.codec) {
+                                // Discover sidecars at scan time only when merge
+                                // mode is on — that's what drives the
+                                // SkipNoSubtitles decision and what the encode
+                                // step will reuse. Plain encode mode does
+                                // discovery later, gated on the embed checkbox.
+                                let subs = if merge_subtitles {
+                                    scan::discover_subtitles(abs)
+                                } else {
+                                    Vec::new()
+                                };
+                                let dec = if merge_subtitles {
+                                    if subs.is_empty() {
+                                        Decision::SkipNoSubtitles
+                                    } else {
+                                        Decision::Encode
+                                    }
+                                } else if force || !codec.matches_source(&info.codec) {
                                     Decision::Encode
                                 } else {
                                     Decision::SkipAlreadyTarget
@@ -586,6 +614,7 @@ impl App {
                                     info.duration_secs,
                                     info.subtitle_codecs,
                                     info.unmappable_stream_indices,
+                                    subs,
                                     dec,
                                 )
                             }
@@ -610,6 +639,7 @@ impl App {
                         duration_secs,
                         source_subtitle_codecs,
                         unmappable_stream_indices,
+                        discovered_subtitles,
                         decision,
                         status: Status::Pending,
                     };
@@ -665,6 +695,7 @@ impl App {
         }
 
         let embed_subtitles = self.embed_subtitles;
+        let merge_subtitles = self.merge_subtitles;
         let jobs: Vec<(usize, FileEntry, Vec<SubtitleInput>)> = self
             .files
             .iter()
@@ -672,7 +703,20 @@ impl App {
             .filter(|(_, f)| matches!(f.decision, Decision::Encode))
             .filter(|(_, f)| !matches!(f.status, Status::Done))
             .map(|(i, f)| {
-                let subs = if embed_subtitles {
+                // Merge mode already discovered sidecars at scan time; reuse
+                // them so the table view and the encode share one source of
+                // truth. Plain encode mode does discovery here only when the
+                // user has opted in via the embed-subtitles checkbox.
+                let subs = if merge_subtitles {
+                    f.discovered_subtitles
+                        .iter()
+                        .cloned()
+                        .map(|s| SubtitleInput {
+                            path: s.path,
+                            language: s.language,
+                        })
+                        .collect()
+                } else if embed_subtitles {
                     media_convert::scan::discover_subtitles(&f.abs)
                         .into_iter()
                         .map(|s| SubtitleInput {
@@ -732,6 +776,7 @@ impl App {
                     subtitles: &subs,
                     source_subtitle_codecs: &entry.source_subtitle_codecs,
                     unmappable_stream_indices: &entry.unmappable_stream_indices,
+                    merge_only: merge_subtitles,
                 };
                 let result = run_one(
                     &entry.abs,
@@ -1194,6 +1239,12 @@ impl eframe::App for App {
                                     "Embed sidecar SRT subtitles",
                                 )
                                 .on_hover_text(HINT_EMBED_SUBTITLES);
+                                ui.separator();
+                                ui.checkbox(
+                                    &mut self.merge_subtitles,
+                                    "Merge subtitles only (no re-encode)",
+                                )
+                                .on_hover_text(HINT_MERGE_SUBTITLES);
                             });
                         });
                     if response.header_response.clicked() {
@@ -1603,6 +1654,7 @@ fn decision_ui(ui: &mut egui::Ui, d: &Decision) {
         Decision::Encode => ("encode", STATUS_ENCODE),
         Decision::SkipAlreadyTarget => ("skip (target)", egui::Color32::GRAY),
         Decision::SkipOutputExists => ("skip (exists)", egui::Color32::GRAY),
+        Decision::SkipNoSubtitles => ("skip (no sidecar subs)", egui::Color32::GRAY),
     };
     ui.colored_label(color, text);
 }
@@ -1674,7 +1726,12 @@ fn summarize(files: &[FileEntry]) -> Summary {
         match (&f.decision, &f.status) {
             (_, Status::Done) => s.done += 1,
             (_, Status::Failed(_)) => s.failed += 1,
-            (Decision::SkipAlreadyTarget | Decision::SkipOutputExists, _) => s.skipped += 1,
+            (
+                Decision::SkipAlreadyTarget
+                | Decision::SkipOutputExists
+                | Decision::SkipNoSubtitles,
+                _,
+            ) => s.skipped += 1,
             (Decision::Encode, _) => s.to_encode += 1,
         }
     }

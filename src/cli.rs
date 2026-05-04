@@ -63,4 +63,12 @@ pub struct Cli {
     /// movie.mp4) and mux them into the output as additional subtitle tracks.
     #[arg(long)]
     pub embed_subtitles: bool,
+
+    /// Merge sidecar subtitles into each source without re-encoding the
+    /// video. The video and audio streams are stream-copied and any
+    /// discovered sidecar .srt files are muxed in as new subtitle tracks
+    /// (implies --embed-subtitles). Files with no sidecar SRTs are skipped
+    /// since there'd be nothing to merge.
+    #[arg(long)]
+    pub merge_subtitles: bool,
 }
