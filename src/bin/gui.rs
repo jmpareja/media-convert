@@ -97,6 +97,7 @@ struct FileEntry {
     source_codec: Option<String>,
     duration_secs: Option<f64>,
     source_subtitle_codecs: Vec<String>,
+    unmappable_stream_indices: Vec<usize>,
     decision: Decision,
     status: Status,
 }
@@ -373,33 +374,39 @@ impl App {
                 let mut out = output.join(&rel);
                 out.set_extension(container.extension());
 
-                let (source_codec, duration_secs, source_subtitle_codecs, decision) =
-                    if out.exists() {
-                        (None, None, Vec::new(), Decision::SkipOutputExists)
-                    } else {
-                        match probe::video_info(abs) {
-                            Ok(info) => {
-                                let dec = if force || !codec.matches_source(&info.codec) {
-                                    Decision::Encode
-                                } else {
-                                    Decision::SkipAlreadyTarget
-                                };
-                                (
-                                    Some(info.codec),
-                                    info.duration_secs,
-                                    info.subtitle_codecs,
-                                    dec,
-                                )
-                            }
-                            Err(e) => {
-                                let _ = tx.send(ScanMsg::Error(format!(
-                                    "probe failed for {}: {e:#}",
-                                    rel.display()
-                                )));
-                                continue;
-                            }
+                let (
+                    source_codec,
+                    duration_secs,
+                    source_subtitle_codecs,
+                    unmappable_stream_indices,
+                    decision,
+                ) = if out.exists() {
+                    (None, None, Vec::new(), Vec::new(), Decision::SkipOutputExists)
+                } else {
+                    match probe::video_info(abs) {
+                        Ok(info) => {
+                            let dec = if force || !codec.matches_source(&info.codec) {
+                                Decision::Encode
+                            } else {
+                                Decision::SkipAlreadyTarget
+                            };
+                            (
+                                Some(info.codec),
+                                info.duration_secs,
+                                info.subtitle_codecs,
+                                info.unmappable_stream_indices,
+                                dec,
+                            )
                         }
-                    };
+                        Err(e) => {
+                            let _ = tx.send(ScanMsg::Error(format!(
+                                "probe failed for {}: {e:#}",
+                                rel.display()
+                            )));
+                            continue;
+                        }
+                    }
+                };
 
                 let entry = FileEntry {
                     abs: abs.clone(),
@@ -408,6 +415,7 @@ impl App {
                     source_codec,
                     duration_secs,
                     source_subtitle_codecs,
+                    unmappable_stream_indices,
                     decision,
                     status: Status::Pending,
                 };
@@ -525,6 +533,7 @@ impl App {
                     preset: preset_opt,
                     subtitles: &subs,
                     source_subtitle_codecs: &entry.source_subtitle_codecs,
+                    unmappable_stream_indices: &entry.unmappable_stream_indices,
                 };
                 let result = run_one(
                     &entry.abs,

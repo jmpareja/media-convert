@@ -11,6 +11,7 @@ struct ProbeOutput {
 
 #[derive(Debug, Deserialize)]
 struct Stream {
+    index: Option<u32>,
     codec_name: Option<String>,
     codec_type: Option<String>,
 }
@@ -28,6 +29,12 @@ pub struct VideoInfo {
     /// output codec — MKV can't `-c:s copy` a `mov_text` track, for
     /// instance, so it gets transcoded to SRT.
     pub subtitle_codecs: Vec<String>,
+    /// Source-stream indices the muxer can't accept — streams where
+    /// ffprobe reports no `codec_name` (codec_id 0). Common case:
+    /// `mp4s` MPEG-4 systems data tracks in MP4 sources, which the
+    /// matroska muxer rejects with "Tag mp4s incompatible with output
+    /// codec id '0'". The encoder negative-maps these.
+    pub unmappable_stream_indices: Vec<usize>,
 }
 
 impl VideoInfo {
@@ -42,7 +49,7 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_name,codec_type:format=duration",
+            "stream=index,codec_name,codec_type:format=duration",
             "-of",
             "json",
         ])
@@ -60,7 +67,15 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
 
     let mut codec: Option<String> = None;
     let mut subtitle_codecs: Vec<String> = Vec::new();
+    let mut unmappable_stream_indices: Vec<usize> = Vec::new();
     for s in parsed.streams {
+        let has_codec = s.codec_name.as_deref().is_some_and(|c| !c.is_empty());
+        if !has_codec {
+            if let Some(idx) = s.index {
+                unmappable_stream_indices.push(idx as usize);
+            }
+            continue;
+        }
         match s.codec_type.as_deref() {
             Some("video") if codec.is_none() => codec = s.codec_name,
             Some("subtitle") => {
@@ -82,6 +97,7 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
         codec,
         duration_secs,
         subtitle_codecs,
+        unmappable_stream_indices,
     })
 }
 
