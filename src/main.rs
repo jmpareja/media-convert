@@ -133,6 +133,10 @@ fn main() -> Result<()> {
             .as_ref()
             .map(|i| i.subtitle_codecs.clone())
             .unwrap_or_default();
+        let unmappable_stream_indices: Vec<usize> = info
+            .as_ref()
+            .map(|i| i.unmappable_stream_indices.clone())
+            .unwrap_or_default();
 
         let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles {
             scan::discover_subtitles(input)
@@ -160,6 +164,7 @@ fn main() -> Result<()> {
             preset,
             subtitles: &subtitles,
             source_subtitle_codecs: &source_subtitle_codecs,
+            unmappable_stream_indices: &unmappable_stream_indices,
         };
 
         let rel_str = rel.display().to_string();

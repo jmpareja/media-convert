@@ -31,6 +31,11 @@ pub struct EncodeOptions<'a> {
     /// these — e.g. MKV target rejects `-c:s copy` for `mov_text`, so that
     /// stream gets transcoded to SRT instead.
     pub source_subtitle_codecs: &'a [String],
+    /// Source-stream indices to drop from the output via `-map -0:N`.
+    /// Set by the probe step for streams with unrecognized codecs
+    /// (codec_id 0, like `mp4s` MPEG-4 systems tracks) that the muxer
+    /// would otherwise reject.
+    pub unmappable_stream_indices: &'a [usize],
 }
 
 pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<Child> {
@@ -64,6 +69,12 @@ pub(crate) fn build_ffmpeg_command(
         "-progress",
         "pipe:1",
         "-n",
+        // Some MP4s carry streams ffmpeg can't identify (codec_id 0, e.g.
+        // the `mp4s` MPEG-4 systems tag). With MKV's `-map 0` policy those
+        // unknown streams reach the matroska muxer, which rejects them
+        // ("Tag mp4s incompatible with output codec id '0'"). Skip them
+        // silently instead of aborting the encode.
+        "-ignore_unknown",
     ]);
 
     for a in &cfg.preamble {
@@ -85,6 +96,12 @@ pub(crate) fn build_ffmpeg_command(
             // sources missing a track don't fail.
             cmd.args(["-map", "0:v", "-map", "0:a?", "-map", "0:s?"]);
         }
+    }
+    // Drop streams the muxer can't accept (codec_id 0, e.g. `mp4s` data
+    // tracks in some MP4 sources). Negative maps must come after the
+    // positive map so they trim the previously-selected set.
+    for idx in opts.unmappable_stream_indices {
+        cmd.arg("-map").arg(format!("-0:{idx}"));
     }
     for i in 0..opts.subtitles.len() {
         cmd.arg("-map").arg(format!("{}", i + 1));
@@ -255,7 +272,56 @@ mod tests {
             preset: None,
             subtitles: &[],
             source_subtitle_codecs: &[],
+            unmappable_stream_indices: &[],
         }
+    }
+
+    #[test]
+    fn unmappable_indices_negative_mapped_after_positive_map() {
+        // Reproduces the Baruto.mp4 case: source has data streams 2 and 3
+        // tagged `mp4s` with no recognized codec. With MKV's `-map 0`, the
+        // matroska muxer rejects them ("Tag mp4s incompatible with output
+        // codec id '0'"). Probe flags the indices, encoder negative-maps
+        // them. Order matters — `-map -0:N` must follow `-map 0` so it
+        // trims the previously-selected set.
+        let unmappable = [2usize, 3usize];
+        let mut opts = opts_software_x265();
+        opts.unmappable_stream_indices = &unmappable;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        let positive = args
+            .windows(2)
+            .position(|w| w == ["-map", "0"])
+            .expect("has -map 0");
+        let neg2 = args
+            .windows(2)
+            .position(|w| w == ["-map", "-0:2"])
+            .expect("has -map -0:2");
+        let neg3 = args
+            .windows(2)
+            .position(|w| w == ["-map", "-0:3"])
+            .expect("has -map -0:3");
+        assert!(positive < neg2 && positive < neg3);
+    }
+
+    #[test]
+    fn ffmpeg_command_passes_ignore_unknown_globally() {
+        // Some MP4 sources contain streams ffmpeg can't identify (e.g.
+        // `mp4s` MPEG-4 systems streams). With MKV's `-map 0`, those would
+        // hit the matroska muxer and fail. `-ignore_unknown` must appear
+        // before -i so the muxer drops them instead.
+        let cmd = build_ffmpeg_command(
+            Path::new("/in/a.mp4"),
+            Path::new("/out/a.mkv"),
+            &opts_software_x265(),
+        );
+        let args = args_of(&cmd);
+        let flag_idx = args
+            .iter()
+            .position(|a| a == "-ignore_unknown")
+            .expect("has -ignore_unknown");
+        let input_idx = args.iter().position(|a| a == "-i").expect("has -i");
+        assert!(flag_idx < input_idx, "-ignore_unknown must precede -i");
     }
 
     #[test]
