@@ -121,7 +121,8 @@ fn main() -> Result<()> {
             }
         }
 
-        let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles || args.merge_subtitles {
+        let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles || args.merge_subtitles
+        {
             scan::discover_subtitles(input)
                 .into_iter()
                 .map(|s| convert::SubtitleInput {
@@ -189,7 +190,11 @@ fn main() -> Result<()> {
         let tty = io::stdout().is_terminal();
         let prefix_for_cb = prefix.clone();
         let rel_for_cb = rel_str.clone();
-        let action = if args.merge_subtitles { "merging" } else { "encoding" };
+        let action = if args.merge_subtitles {
+            "merging"
+        } else {
+            "encoding"
+        };
         if tty {
             print!("{prefix}   0% {rel_str}");
             let _ = io::stdout().flush();

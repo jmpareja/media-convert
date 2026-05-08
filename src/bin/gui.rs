@@ -1375,9 +1375,7 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         match self.selected_file_index.and_then(|i| self.files.get(i)) {
                             None => {
-                                ui.label(
-                                    "Select a file in the table above to view its metadata.",
-                                );
+                                ui.label("Select a file in the table above to view its metadata.");
                             }
                             Some(entry) => match &entry.metadata {
                                 MetaState::NotLoaded | MetaState::Loading => {
