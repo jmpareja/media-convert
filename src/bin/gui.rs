@@ -142,6 +142,14 @@ enum Status {
 }
 
 #[derive(Clone, Debug)]
+enum MetaState {
+    NotLoaded,
+    Loading,
+    Loaded(probe::FileMetadata),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
 struct FileEntry {
     abs: PathBuf,
     rel: PathBuf,
@@ -159,6 +167,7 @@ struct FileEntry {
     discovered_subtitles: Vec<SidecarSubtitle>,
     decision: Decision,
     status: Status,
+    metadata: MetaState,
 }
 
 enum ScanMsg {
@@ -225,6 +234,8 @@ struct App {
     sort_column: Option<SortColumn>,
     sort_ascending: bool,
     selected_file_index: Option<usize>,
+    metadata_tx: Sender<(PathBuf, std::result::Result<probe::FileMetadata, String>)>,
+    metadata_rx: Receiver<(PathBuf, std::result::Result<probe::FileMetadata, String>)>,
 }
 
 impl Default for App {
@@ -232,6 +243,7 @@ impl Default for App {
         let codec = Codec::X265;
         let backend = Backend::Software;
         let cfg = backend.config(codec);
+        let (metadata_tx, metadata_rx) = channel();
         Self {
             sources: Vec::new(),
             output: None,
@@ -256,6 +268,8 @@ impl Default for App {
             sort_column: None,
             sort_ascending: true,
             selected_file_index: None,
+            metadata_tx,
+            metadata_rx,
         }
     }
 }
@@ -642,6 +656,7 @@ impl App {
                         discovered_subtitles,
                         decision,
                         status: Status::Pending,
+                        metadata: MetaState::NotLoaded,
                     };
                     if tx.send(ScanMsg::Discovered(entry)).is_err() {
                         return;
@@ -820,6 +835,23 @@ impl App {
         }
     }
 
+    fn select_file(&mut self, idx: usize) {
+        self.selected_file_index = Some(idx);
+        let Some(entry) = self.files.get_mut(idx) else {
+            return;
+        };
+        if !matches!(entry.metadata, MetaState::NotLoaded) {
+            return;
+        }
+        entry.metadata = MetaState::Loading;
+        let path = entry.abs.clone();
+        let tx = self.metadata_tx.clone();
+        thread::spawn(move || {
+            let result = probe::file_metadata(&path).map_err(|e| format!("{e:#}"));
+            let _ = tx.send((path, result));
+        });
+    }
+
     fn drain_workers(&mut self, ctx: &egui::Context) {
         let mut needs_repaint = false;
         let mut deferred_log: Vec<String> = Vec::new();
@@ -910,6 +942,22 @@ impl App {
                         break;
                     }
                 }
+            }
+        }
+
+        loop {
+            match self.metadata_rx.try_recv() {
+                Ok((path, result)) => {
+                    if let Some(f) = self.files.iter_mut().find(|f| f.abs == path) {
+                        f.metadata = match result {
+                            Ok(m) => MetaState::Loaded(m),
+                            Err(e) => MetaState::Failed(e),
+                        };
+                    }
+                    needs_repaint = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
 
@@ -1312,6 +1360,49 @@ impl eframe::App for App {
                 ui.add_space(4.0);
             });
 
+        // Metadata panel: lazy-loaded ffprobe details for the selected file,
+        // sits above the log panel.
+        egui::TopBottomPanel::bottom("metadata")
+            .resizable(true)
+            .default_height(200.0)
+            .frame(panel_frame)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("Metadata").strong());
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        match self.selected_file_index.and_then(|i| self.files.get(i)) {
+                            None => {
+                                ui.label(
+                                    "Select a file in the table above to view its metadata.",
+                                );
+                            }
+                            Some(entry) => match &entry.metadata {
+                                MetaState::NotLoaded | MetaState::Loading => {
+                                    ui.label(format!(
+                                        "Loading metadata for {}…",
+                                        entry.rel.display()
+                                    ));
+                                }
+                                MetaState::Failed(err) => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 80, 80),
+                                        format!(
+                                            "Failed to read metadata for {}:\n{err}",
+                                            entry.rel.display()
+                                        ),
+                                    );
+                                }
+                                MetaState::Loaded(meta) => {
+                                    render_metadata(ui, entry, meta);
+                                }
+                            },
+                        }
+                    });
+            });
+
         egui::TopBottomPanel::bottom("bottom")
             .resizable(true)
             .default_height(140.0)
@@ -1631,8 +1722,10 @@ impl eframe::App for App {
                 stroke,
             );
 
+            // `select_file` both updates the selection index and kicks off a
+            // background metadata fetch (no-op if already loaded/loading).
             if let Some(idx) = newly_selected {
-                self.selected_file_index = Some(idx);
+                self.select_file(idx);
             }
         });
 
@@ -1756,4 +1849,134 @@ fn format_bitrate(bps: u64) -> String {
     } else {
         format!("{:.0} kbps", bps as f64 / 1_000.0)
     }
+}
+
+fn render_metadata(ui: &mut egui::Ui, entry: &FileEntry, meta: &probe::FileMetadata) {
+    egui::Grid::new("metadata_format_grid")
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Path");
+            ui.monospace(entry.abs.display().to_string());
+            ui.end_row();
+
+            if let Some(name) = &meta.format_name {
+                ui.strong("Container");
+                let label = match &meta.format_long_name {
+                    Some(long) if long != name => format!("{name}  ({long})"),
+                    _ => name.clone(),
+                };
+                ui.label(label);
+                ui.end_row();
+            }
+
+            if let Some(size) = meta.size_bytes {
+                ui.strong("Size");
+                ui.label(format!("{} ({} bytes)", format_bytes(size), size));
+                ui.end_row();
+            }
+
+            if let Some(d) = meta.duration_secs {
+                ui.strong("Duration");
+                ui.label(format_duration(d));
+                ui.end_row();
+            }
+
+            if let Some(br) = meta.bit_rate {
+                ui.strong("Overall bitrate");
+                ui.label(format!("{} kb/s", br / 1000));
+                ui.end_row();
+            }
+
+            if let Some(t) = &meta.title {
+                ui.strong("Title");
+                ui.label(t);
+                ui.end_row();
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(format!("Streams ({})", meta.streams.len())).strong());
+    ui.add_space(2.0);
+
+    for s in &meta.streams {
+        let codec = s.codec_name.as_deref().unwrap_or("(unknown)");
+        let header = format!("#{} {}: {}", s.index, s.codec_type, codec);
+        ui.monospace(header);
+        let detail = stream_detail(s);
+        if !detail.is_empty() {
+            ui.monospace(format!("    {detail}"));
+        }
+    }
+}
+
+fn stream_detail(s: &probe::StreamInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(profile) = &s.profile {
+        parts.push(format!("profile={profile}"));
+    }
+    if let (Some(w), Some(h)) = (s.width, s.height) {
+        parts.push(format!("{w}×{h}"));
+    }
+    if let Some(p) = &s.pix_fmt {
+        parts.push(p.clone());
+    }
+    if let Some(r) = &s.frame_rate {
+        parts.push(format_frame_rate(r));
+    }
+    if let Some(c) = s.channels {
+        match s.channel_layout.as_deref() {
+            Some(layout) if !layout.is_empty() => parts.push(format!("{c}ch ({layout})")),
+            _ => parts.push(format!("{c}ch")),
+        }
+    }
+    if let Some(sr) = s.sample_rate {
+        parts.push(format!("{sr} Hz"));
+    }
+    if let Some(b) = s.bit_rate {
+        parts.push(format!("{} kb/s", b / 1000));
+    }
+    if let Some(lang) = &s.language {
+        parts.push(format!("lang={lang}"));
+    }
+    if let Some(t) = &s.title {
+        parts.push(format!("title=\"{t}\""));
+    }
+    let mut flags: Vec<&str> = Vec::new();
+    if s.default {
+        flags.push("default");
+    }
+    if s.forced {
+        flags.push("forced");
+    }
+    if !flags.is_empty() {
+        parts.push(format!("[{}]", flags.join(",")));
+    }
+    parts.join(" • ")
+}
+
+fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if n >= GIB {
+        format!("{:.2} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.2} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.2} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn format_frame_rate(s: &str) -> String {
+    if let Some((n, d)) = s.split_once('/')
+        && let (Ok(n), Ok(d)) = (n.parse::<f64>(), d.parse::<f64>())
+        && d > 0.0
+    {
+        return format!("{:.3} fps", n / d);
+    }
+    s.to_string()
 }
