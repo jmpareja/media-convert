@@ -192,7 +192,14 @@ pub struct FileMetadata {
 
 pub fn file_metadata(path: &Path) -> Result<FileMetadata> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_streams", "-show_format", "-of", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+        ])
         .arg(path)
         .output()
         .context("failed to invoke ffprobe (is it installed and on PATH?)")?;
@@ -269,5 +276,6 @@ pub fn file_metadata(path: &Path) -> Result<FileMetadata> {
 
 fn pick_frame_rate(avg: Option<String>, r: Option<String>) -> Option<String> {
     let usable = |s: &str| !s.is_empty() && s != "0/0";
-    avg.filter(|s| usable(s)).or_else(|| r.filter(|s| usable(s)))
+    avg.filter(|s| usable(s))
+        .or_else(|| r.filter(|s| usable(s)))
 }
