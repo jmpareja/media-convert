@@ -2,23 +2,36 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Default output directory when the user doesn't provide one: a sibling of
-/// the source directory whose name has `-converted` appended. For a single
-/// file source, the source's parent directory is used as the basis.
+use crate::container::Container;
+
+/// Default output path when the user doesn't provide one.
+///
+/// For a directory source, it returns a sibling directory with `-converted` appended.
+/// For a single file source, it returns a file in the same directory with
+/// `-converted` appended to the stem and the target container extension.
 ///
 /// Examples:
 /// * `/movies/library` -> `/movies/library-converted`
-/// * `/movies/library/movie.mkv` -> `/movies/library-converted`
+/// * `/movies/library/movie.mkv` -> `/movies/library/movie-converted.mkv` (if container is Mkv)
 /// * `library` -> `library-converted`
 ///
 /// Falls back to `<source>/converted` when the source has no usable file name
 /// (e.g. `/`, `.`).
-pub fn default_output_dir(source: &Path) -> PathBuf {
-    let basis: &Path = if source.is_file() {
-        source.parent().unwrap_or(source)
-    } else {
-        source
-    };
+pub fn default_output(source: &Path, container: Container) -> PathBuf {
+    if source.is_file() {
+        let mut p = source.to_path_buf();
+        if let Some(stem) = source.file_stem() {
+            let new_name = format!(
+                "{}-converted.{}",
+                stem.to_string_lossy(),
+                container.extension()
+            );
+            p.set_file_name(new_name);
+        }
+        return p;
+    }
+
+    let basis: &Path = source;
     let Some(name) = basis.file_name() else {
         return basis.join("converted");
     };
@@ -56,15 +69,11 @@ pub fn validate_output(output: &Path, expected_bytes: Option<u64>) -> Result<Out
             );
         }
     } else {
-        fs::create_dir_all(output).with_context(|| {
-            format!("could not create output directory {}", output.display())
-        })?;
+        fs::create_dir_all(output)
+            .with_context(|| format!("could not create output directory {}", output.display()))?;
     }
 
-    let probe = output.join(format!(
-        ".media-convert-write-probe-{}",
-        std::process::id()
-    ));
+    let probe = output.join(format!(".media-convert-write-probe-{}", std::process::id()));
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -136,46 +145,43 @@ mod tests {
         let src = dir.path().join("library");
         fs::create_dir(&src).unwrap();
 
-        let out = default_output_dir(&src);
+        let out = default_output(&src, Container::Mkv);
         assert_eq!(out, dir.path().join("library-converted"));
     }
 
     #[test]
-    fn file_source_uses_parents_sibling() {
+    fn file_source_stays_in_same_directory_with_suffix() {
         let dir = tempdir().unwrap();
         let lib = dir.path().join("library");
         fs::create_dir(&lib).unwrap();
-        let file = lib.join("movie.mkv");
+        let file = lib.join("movie.mp4");
         fs::write(&file, b"").unwrap();
 
-        let out = default_output_dir(&file);
-        assert_eq!(out, dir.path().join("library-converted"));
+        let out = default_output(&file, Container::Mkv);
+        assert_eq!(out, lib.join("movie-converted.mkv"));
     }
 
     #[test]
     fn relative_directory_stays_relative() {
-        // Path doesn't need to exist — we still derive the name.
-        let out = default_output_dir(Path::new("movies"));
+        let out = default_output(Path::new("movies"), Container::Mkv);
         assert_eq!(out, PathBuf::from("movies-converted"));
     }
 
     #[test]
     fn nested_relative_directory_keeps_parent() {
-        let out = default_output_dir(Path::new("a/b/library"));
+        let out = default_output(Path::new("a/b/library"), Container::Mkv);
         assert_eq!(out, PathBuf::from("a/b/library-converted"));
     }
 
     #[test]
     fn root_path_falls_back_to_subdirectory() {
-        // `/` has no file_name; we fall back to `<source>/converted` rather
-        // than producing an empty/garbage sibling name.
-        let out = default_output_dir(Path::new("/"));
+        let out = default_output(Path::new("/"), Container::Mkv);
         assert_eq!(out, PathBuf::from("/converted"));
     }
 
     #[test]
     fn single_segment_absolute_path_stays_under_root() {
-        let out = default_output_dir(Path::new("/library"));
+        let out = default_output(Path::new("/library"), Container::Mkv);
         assert_eq!(out, PathBuf::from("/library-converted"));
     }
 
@@ -229,7 +235,11 @@ mod tests {
         let dir = tempdir().unwrap();
         // 1 KiB easily fits anywhere a tempdir lives.
         let v = validate_output(dir.path(), Some(1024)).expect("should succeed");
-        assert!(v.warnings.is_empty(), "unexpected warnings: {:?}", v.warnings);
+        assert!(
+            v.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            v.warnings
+        );
     }
 
     #[test]

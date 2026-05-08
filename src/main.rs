@@ -11,7 +11,7 @@ use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{self, EncodeOptions};
 use media_convert::inhibit::Inhibitor;
-use media_convert::output::{default_output_dir, sum_file_sizes, validate_output};
+use media_convert::output::{default_output, sum_file_sizes, validate_output};
 use media_convert::{probe, scan};
 
 fn main() -> Result<()> {
@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     let output_root: PathBuf = args
         .output
         .clone()
-        .unwrap_or_else(|| default_output_dir(&args.source));
+        .unwrap_or_else(|| default_output(&args.source, args.container));
     if args.output.is_none() {
         println!(
             "--output not given; defaulting to {}",
@@ -90,10 +90,7 @@ fn main() -> Result<()> {
     };
 
     for (idx, input) in videos.iter().enumerate() {
-        let rel = input
-            .strip_prefix(&rel_root)
-            .unwrap_or(input)
-            .to_path_buf();
+        let rel = input.strip_prefix(&rel_root).unwrap_or(input).to_path_buf();
         let output = if single_file_mode && output_is_filepath(&output_root) {
             output_root.clone()
         } else {
@@ -123,7 +120,11 @@ fn main() -> Result<()> {
         }
 
         if args.dry_run {
-            println!("{prefix} would encode: {} -> {}", rel.display(), output.display());
+            println!(
+                "{prefix} would encode: {} -> {}",
+                rel.display(),
+                output.display()
+            );
             continue;
         }
 
@@ -177,11 +178,11 @@ fn main() -> Result<()> {
         } else {
             println!("{prefix} encoding: {} -> {}", rel_str, output.display());
         }
-        let on_progress = move |frac: Option<f64>| {
+        let on_progress = move |info: convert::ProgressInfo| {
             if !tty {
                 return;
             }
-            let pct = frac.map(|f| (f * 100.0) as u32).unwrap_or(0);
+            let pct = info.fraction.map(|f| (f * 100.0) as u32).unwrap_or(0);
             let mut out = io::stdout().lock();
             let _ = write!(out, "\r{prefix_for_cb} {pct:>3}% {rel_for_cb}\x1b[K");
             let _ = out.flush();
