@@ -64,8 +64,7 @@ mod tests {
 
     #[test]
     fn missing_program_yields_inactive() {
-        let inh =
-            Inhibitor::acquire_with("media-convert-no-such-binary-xyz-9f2a", "test");
+        let inh = Inhibitor::acquire_with("media-convert-no-such-binary-xyz-9f2a", "test");
         assert!(!inh.is_active());
         // Drop must be a no-op when there's no child.
     }

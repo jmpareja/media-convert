@@ -232,10 +232,7 @@ mod tests {
             .iter()
             .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            names,
-            vec!["show.de.srt", "show.en.srt", "show.fr.srt"]
-        );
+        assert_eq!(names, vec!["show.de.srt", "show.en.srt", "show.fr.srt"]);
     }
 
     #[test]

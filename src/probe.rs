@@ -14,6 +14,9 @@ struct Stream {
     index: Option<u32>,
     codec_name: Option<String>,
     codec_type: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    bit_rate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +26,9 @@ struct Format {
 
 pub struct VideoInfo {
     pub codec: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bit_rate: Option<u64>,
     pub duration_secs: Option<f64>,
     /// Codec name (`codec_name` from ffprobe) for each subtitle stream,
     /// in source-stream order. Used by the encoder to pick a per-stream
@@ -49,7 +55,7 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
             "-v",
             "error",
             "-show_entries",
-            "stream=index,codec_name,codec_type:format=duration",
+            "stream=index,codec_name,codec_type,width,height,bit_rate:format=duration",
             "-of",
             "json",
         ])
@@ -66,6 +72,9 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
         .with_context(|| format!("failed to parse ffprobe JSON for {}", path.display()))?;
 
     let mut codec: Option<String> = None;
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    let mut bit_rate: Option<u64> = None;
     let mut subtitle_codecs: Vec<String> = Vec::new();
     let mut unmappable_stream_indices: Vec<usize> = Vec::new();
     for s in parsed.streams {
@@ -77,15 +86,19 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
             continue;
         }
         match s.codec_type.as_deref() {
-            Some("video") if codec.is_none() => codec = s.codec_name,
+            Some("video") if codec.is_none() => {
+                codec = s.codec_name;
+                width = s.width;
+                height = s.height;
+                bit_rate = s.bit_rate.and_then(|r| r.parse().ok());
+            }
             Some("subtitle") => {
                 subtitle_codecs.push(s.codec_name.unwrap_or_default());
             }
             _ => {}
         }
     }
-    let codec = codec
-        .with_context(|| format!("no video stream found in {}", path.display()))?;
+    let codec = codec.with_context(|| format!("no video stream found in {}", path.display()))?;
 
     let duration_secs = parsed
         .format
@@ -95,6 +108,9 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
 
     Ok(VideoInfo {
         codec,
+        width,
+        height,
+        bit_rate,
         duration_secs,
         subtitle_codecs,
         unmappable_stream_indices,

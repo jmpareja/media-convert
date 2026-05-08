@@ -51,11 +51,7 @@ pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result
 
 /// Construct the `ffmpeg` invocation for this encode without spawning.
 /// Extracted from `spawn_encode` so its argument layout can be unit-tested.
-pub(crate) fn build_ffmpeg_command(
-    input: &Path,
-    output: &Path,
-    opts: &EncodeOptions,
-) -> Command {
+pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOptions) -> Command {
     let cfg = opts.backend.config(opts.codec);
     let quality = opts.quality.to_string();
     let effective_preset: Option<&str> = opts.preset.or(cfg.default_preset);
@@ -185,16 +181,26 @@ fn file_protocol_arg(p: &Path) -> OsString {
     s
 }
 
-/// Drain ffmpeg's `-progress` stream until EOF, invoking `on_progress` with a
-/// fraction in [0.0, 1.0] each time `out_time` advances. If `total_secs` is
-/// `None`, the fraction is `None` (caller can show indeterminate progress).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgressInfo {
+    pub fraction: Option<f64>,
+    pub fps: Option<f32>,
+    pub speed: Option<f32>,
+}
+
+/// Drain ffmpeg's `-progress` stream until EOF, invoking `on_progress` with
+/// updated stats.
 pub fn read_progress<R, F>(stdout: R, total_secs: Option<f64>, mut on_progress: F)
 where
     R: Read,
-    F: FnMut(Option<f64>),
+    F: FnMut(ProgressInfo),
 {
     let total_us = total_secs.map(|s| (s * 1_000_000.0).max(1.0));
     let reader = BufReader::new(stdout);
+    let mut current_us = 0.0;
+    let mut current_fps = None;
+    let mut current_speed = None;
+
     for line in reader.lines().map_while(|r| r.ok()) {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -202,17 +208,29 @@ where
         let key = key.trim();
         let value = value.trim();
         match key {
-            // ffmpeg historically emitted `out_time_ms` whose value was actually
-            // microseconds; newer builds emit `out_time_us`. Treat both the same.
             "out_time_us" | "out_time_ms" => {
                 if let Ok(us) = value.parse::<i64>() {
-                    let us = us.max(0) as f64;
-                    let frac = total_us.map(|t| (us / t).clamp(0.0, 1.0));
-                    on_progress(frac);
+                    current_us = us.max(0) as f64;
                 }
             }
-            "progress" if value == "end" => {
-                on_progress(Some(1.0));
+            "fps" => {
+                current_fps = value.parse::<f32>().ok();
+            }
+            "speed" => {
+                // value is e.g. "1.23x"
+                current_speed = value.strip_suffix('x').and_then(|s| s.parse::<f32>().ok());
+            }
+            "progress" => {
+                let frac = if value == "end" {
+                    Some(1.0)
+                } else {
+                    total_us.map(|t| (current_us / t).clamp(0.0, 1.0))
+                };
+                on_progress(ProgressInfo {
+                    fraction: frac,
+                    fps: current_fps,
+                    speed: current_speed,
+                });
             }
             _ => {}
         }
@@ -231,14 +249,15 @@ pub fn encode_with_progress<F>(
     on_progress: F,
 ) -> Result<()>
 where
-    F: FnMut(Option<f64>) + Send + 'static,
+    F: FnMut(ProgressInfo) + Send + 'static,
 {
     let mut child = spawn_encode(input, output, opts)?;
     let stdout = child
         .stdout
         .take()
         .context("ffmpeg child has no stdout pipe")?;
-    let progress_thread = std::thread::spawn(move || read_progress(stdout, total_secs, on_progress));
+    let progress_thread =
+        std::thread::spawn(move || read_progress(stdout, total_secs, on_progress));
     let status = child.wait().context("waiting on ffmpeg")?;
     let _ = progress_thread.join();
     if !status.success() {
@@ -441,7 +460,10 @@ mod tests {
         assert!(dev_idx < input_idx, "preamble must precede -i");
         assert_eq!(args[dev_idx + 1], "/dev/dri/renderD128");
         // VAAPI requires the upload filter
-        assert!(args.windows(2).any(|w| w == ["-vf", "format=nv12,hwupload"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-vf", "format=nv12,hwupload"])
+        );
         // VAAPI uses hevc_vaapi for x265 with -qp
         assert!(args.windows(2).any(|w| w == ["-c:v", "hevc_vaapi"]));
         assert!(args.iter().any(|a| a == "-qp"));
@@ -580,70 +602,155 @@ mod tests {
         );
         assert_eq!(
             args.last().map(String::as_str),
-            Some("file:/run/user/1000/gvfs/smb-share:server=192.168.1.134,share=tv/Firefly (2002)-converted/ep1.mkv")
+            Some(
+                "file:/run/user/1000/gvfs/smb-share:server=192.168.1.134,share=tv/Firefly (2002)-converted/ep1.mkv"
+            )
         );
     }
 
-    fn collect_progress(input: &[u8], total_secs: Option<f64>) -> Vec<Option<f64>> {
+    fn collect_progress(input: &[u8], total_secs: Option<f64>) -> Vec<ProgressInfo> {
         let calls = RefCell::new(Vec::new());
-        read_progress(input, total_secs, |frac| calls.borrow_mut().push(frac));
+        read_progress(input, total_secs, |info| calls.borrow_mut().push(info));
         calls.into_inner()
     }
 
     #[test]
     fn read_progress_emits_fraction_for_out_time_us() {
-        let calls = collect_progress(b"out_time_us=500000\n", Some(1.0));
-        assert_eq!(calls, vec![Some(0.5)]);
+        let calls = collect_progress(b"out_time_us=500000\nprogress=continue\n", Some(1.0));
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(0.5),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_treats_out_time_ms_as_microseconds() {
         // ffmpeg's `out_time_ms` is historically microseconds, not milliseconds.
-        let calls = collect_progress(b"out_time_ms=750000\n", Some(1.5));
-        assert_eq!(calls, vec![Some(0.5)]);
+        let calls = collect_progress(b"out_time_ms=750000\nprogress=continue\n", Some(1.5));
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(0.5),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_emits_none_when_total_unknown() {
-        let calls = collect_progress(b"out_time_us=500000\n", None);
-        assert_eq!(calls, vec![None]);
+        let calls = collect_progress(b"out_time_us=500000\nprogress=continue\n", None);
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: None,
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_clamps_overshoot() {
-        let calls = collect_progress(b"out_time_us=2000000\n", Some(1.0));
-        assert_eq!(calls, vec![Some(1.0)]);
+        let calls = collect_progress(b"out_time_us=2000000\nprogress=continue\n", Some(1.0));
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(1.0),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_treats_negative_values_as_zero() {
-        let calls = collect_progress(b"out_time_us=-100\n", Some(1.0));
-        assert_eq!(calls, vec![Some(0.0)]);
+        let calls = collect_progress(b"out_time_us=-100\nprogress=continue\n", Some(1.0));
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(0.0),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_emits_one_on_end_marker() {
         let calls = collect_progress(b"progress=end\n", Some(60.0));
-        assert_eq!(calls, vec![Some(1.0)]);
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(1.0),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_ignores_unknown_keys_and_malformed_lines() {
-        let input = b"frame=42\nbitrate=500kbps\nnokey\nout_time_us=invalid\nout_time_us=1000000\n";
+        let input = b"frame=42\nbitrate=500kbps\nnokey\nout_time_us=invalid\nout_time_us=1000000\nprogress=continue\n";
         let calls = collect_progress(input, Some(2.0));
-        assert_eq!(calls, vec![Some(0.5)]);
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(0.5),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 
     #[test]
     fn read_progress_emits_for_each_advance() {
-        let input = b"out_time_us=250000\nout_time_us=500000\nout_time_us=750000\nprogress=end\n";
+        let input = b"out_time_us=250000\nprogress=continue\nout_time_us=500000\nprogress=continue\nout_time_us=750000\nprogress=continue\nprogress=end\n";
         let calls = collect_progress(input, Some(1.0));
-        assert_eq!(calls, vec![Some(0.25), Some(0.5), Some(0.75), Some(1.0)]);
+        assert_eq!(
+            calls,
+            vec![
+                ProgressInfo {
+                    fraction: Some(0.25),
+                    fps: None,
+                    speed: None
+                },
+                ProgressInfo {
+                    fraction: Some(0.5),
+                    fps: None,
+                    speed: None
+                },
+                ProgressInfo {
+                    fraction: Some(0.75),
+                    fps: None,
+                    speed: None
+                },
+                ProgressInfo {
+                    fraction: Some(1.0),
+                    fps: None,
+                    speed: None
+                }
+            ]
+        );
     }
 
     #[test]
     fn read_progress_strips_whitespace_around_key_and_value() {
-        let calls = collect_progress(b"  out_time_us  =  500000  \n", Some(1.0));
-        assert_eq!(calls, vec![Some(0.5)]);
+        let calls = collect_progress(
+            b"  out_time_us  =  500000  \n  progress  =  continue  \n",
+            Some(1.0),
+        );
+        assert_eq!(
+            calls,
+            vec![ProgressInfo {
+                fraction: Some(0.5),
+                fps: None,
+                speed: None
+            }]
+        );
     }
 }
