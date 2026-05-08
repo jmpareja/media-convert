@@ -36,6 +36,12 @@ pub struct EncodeOptions<'a> {
     /// (codec_id 0, like `mp4s` MPEG-4 systems tracks) that the muxer
     /// would otherwise reject.
     pub unmappable_stream_indices: &'a [usize],
+    /// Skip re-encoding the video stream — copy it through (`-c:v copy`),
+    /// suppress any backend-specific preamble / filter / quality flag, and
+    /// just remux. Used by `--merge-subtitles` to add subtitle tracks to a
+    /// file without burning encoder cycles on a stream we'd otherwise be
+    /// passing through unchanged.
+    pub merge_only: bool,
 }
 
 pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<Child> {
@@ -73,8 +79,13 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
         "-ignore_unknown",
     ]);
 
-    for a in &cfg.preamble {
-        cmd.arg(a);
+    // Skip backend init (hwaccel, vaapi_device) in merge-only mode — we're
+    // not touching the video stream, so bringing up the GPU just to remux
+    // would be pure overhead.
+    if !opts.merge_only {
+        for a in &cfg.preamble {
+            cmd.arg(a);
+        }
     }
 
     cmd.arg("-i").arg(file_protocol_arg(input));
@@ -103,19 +114,24 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
         cmd.arg("-map").arg(format!("{}", i + 1));
     }
 
-    if let Some(filter) = &cfg.video_filter {
-        cmd.args(["-vf", filter]);
-    }
+    if opts.merge_only {
+        // Stream-copy the video; no filter / quality / preset apply.
+        cmd.args(["-c:v", "copy"]);
+    } else {
+        if let Some(filter) = &cfg.video_filter {
+            cmd.args(["-vf", filter]);
+        }
 
-    cmd.args(["-c:v", cfg.encoder]);
-    cmd.args([cfg.quality_flag, &quality]);
+        cmd.args(["-c:v", cfg.encoder]);
+        cmd.args([cfg.quality_flag, &quality]);
 
-    if let Some(preset) = effective_preset {
-        cmd.args(["-preset", preset]);
-    }
+        if let Some(preset) = effective_preset {
+            cmd.args(["-preset", preset]);
+        }
 
-    for a in &cfg.extra_post {
-        cmd.arg(a);
+        for a in &cfg.extra_post {
+            cmd.arg(a);
+        }
     }
 
     cmd.args(["-c:a", "copy"]);
@@ -292,6 +308,7 @@ mod tests {
             subtitles: &[],
             source_subtitle_codecs: &[],
             unmappable_stream_indices: &[],
+            merge_only: false,
         }
     }
 
@@ -752,5 +769,66 @@ mod tests {
                 speed: None
             }]
         );
+    }
+
+    #[test]
+    fn merge_only_emits_video_copy_and_omits_encoder_args() {
+        let mut opts = opts_software_x265();
+        opts.merge_only = true;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        // Stream copy the video — no libx265, no -crf, no -preset, no filter.
+        assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]));
+        assert!(!args.iter().any(|a| a == "libx265"));
+        assert!(!args.iter().any(|a| a == "-crf"));
+        assert!(!args.iter().any(|a| a == "-preset"));
+        assert!(!args.iter().any(|a| a == "-vf"));
+    }
+
+    #[test]
+    fn merge_only_skips_backend_preamble() {
+        // Backend init (e.g. VAAPI device, NVENC -hwaccel) is pointless when
+        // we're not touching the video stream — it should be suppressed so a
+        // user without a working GPU can still merge subs with backend=vaapi.
+        let mut opts = opts_software_x265();
+        opts.backend = Backend::Vaapi;
+        opts.merge_only = true;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-vaapi_device"));
+        assert!(!args.iter().any(|a| a == "-hwaccel"));
+        assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]));
+    }
+
+    #[test]
+    fn merge_only_still_muxes_sidecar_subtitles() {
+        // The whole point of merge mode: stream-copy video while pulling in
+        // sidecar SRTs as new subtitle tracks.
+        let subs = [SubtitleInput {
+            path: PathBuf::from("/in/a.en.srt"),
+            language: Some("en".into()),
+        }];
+        let mut opts = opts_software_x265();
+        opts.merge_only = true;
+        opts.subtitles = &subs;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        // Sidecar input + map + language metadata still emitted.
+        let inputs: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.as_str() == "-i" && *i + 1 < args.len())
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1], "file:/in/a.en.srt");
+        assert!(args.windows(2).any(|w| w == ["-map", "1"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-metadata:s:s:0", "language=en"])
+        );
+        // Audio still copies; video is the only thing that switched to copy
+        // mode (audio was already copy in normal mode, so this reaffirms it).
+        assert!(args.windows(2).any(|w| w == ["-c:a", "copy"]));
     }
 }

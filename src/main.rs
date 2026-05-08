@@ -105,26 +105,53 @@ fn main() -> Result<()> {
             continue;
         }
 
-        match decide(input, args.codec, args.force) {
-            Ok(Decision::Skip(reason)) => {
-                println!("{prefix} skip ({reason}): {}", rel.display());
-                skipped += 1;
-                continue;
-            }
-            Ok(Decision::Encode) => {}
-            Err(e) => {
-                eprintln!("{prefix} probe failed for {}: {e:#}", rel.display());
-                failed += 1;
-                continue;
+        if !args.merge_subtitles {
+            match decide(input, args.codec, args.force) {
+                Ok(Decision::Skip(reason)) => {
+                    println!("{prefix} skip ({reason}): {}", rel.display());
+                    skipped += 1;
+                    continue;
+                }
+                Ok(Decision::Encode) => {}
+                Err(e) => {
+                    eprintln!("{prefix} probe failed for {}: {e:#}", rel.display());
+                    failed += 1;
+                    continue;
+                }
             }
         }
 
-        if args.dry_run {
+        let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles || args.merge_subtitles {
+            scan::discover_subtitles(input)
+                .into_iter()
+                .map(|s| convert::SubtitleInput {
+                    path: s.path,
+                    language: s.language,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // In merge mode, an input without sidecars produces an output
+        // identical to the input — pointless work. Skip it before we
+        // print "would merge" or fire ffmpeg.
+        if args.merge_subtitles && subtitles.is_empty() {
             println!(
-                "{prefix} would encode: {} -> {}",
-                rel.display(),
-                output.display()
+                "{prefix} skip (no sidecar subtitles to merge): {}",
+                rel.display()
             );
+            skipped += 1;
+            continue;
+        }
+
+        if args.dry_run {
+            let verb = if args.merge_subtitles {
+                "would merge subs into"
+            } else {
+                "would encode"
+            };
+            println!("{prefix} {verb}: {} -> {}", rel.display(), output.display());
             continue;
         }
 
@@ -139,17 +166,6 @@ fn main() -> Result<()> {
             .map(|i| i.unmappable_stream_indices.clone())
             .unwrap_or_default();
 
-        let subtitles: Vec<convert::SubtitleInput> = if args.embed_subtitles {
-            scan::discover_subtitles(input)
-                .into_iter()
-                .map(|s| convert::SubtitleInput {
-                    path: s.path,
-                    language: s.language,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         if !subtitles.is_empty() {
             println!(
                 "{prefix} found {} sidecar subtitle file(s)",
@@ -166,17 +182,19 @@ fn main() -> Result<()> {
             subtitles: &subtitles,
             source_subtitle_codecs: &source_subtitle_codecs,
             unmappable_stream_indices: &unmappable_stream_indices,
+            merge_only: args.merge_subtitles,
         };
 
         let rel_str = rel.display().to_string();
         let tty = io::stdout().is_terminal();
         let prefix_for_cb = prefix.clone();
         let rel_for_cb = rel_str.clone();
+        let action = if args.merge_subtitles { "merging" } else { "encoding" };
         if tty {
             print!("{prefix}   0% {rel_str}");
             let _ = io::stdout().flush();
         } else {
-            println!("{prefix} encoding: {} -> {}", rel_str, output.display());
+            println!("{prefix} {action}: {} -> {}", rel_str, output.display());
         }
         let on_progress = move |info: convert::ProgressInfo| {
             if !tty {
