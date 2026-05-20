@@ -1616,6 +1616,10 @@ impl eframe::App for App {
                     .resizable(true)
                     .vscroll(true)
                     .auto_shrink([false; 2])
+                    // Without `sense(click)` the row's union response never
+                    // reports clicks — so row selection (and the metadata
+                    // fetch) silently no-ops.
+                    .sense(egui::Sense::click())
                     .column(Column::remainder().at_least(150.0).clip(true).resizable(false)) // File
                     .column(Column::initial(90.0).at_least(60.0))           // Resolution
                     .column(Column::initial(90.0).at_least(60.0))           // Bitrate
