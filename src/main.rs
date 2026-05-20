@@ -184,6 +184,7 @@ fn main() -> Result<()> {
             source_subtitle_codecs: &source_subtitle_codecs,
             unmappable_stream_indices: &unmappable_stream_indices,
             merge_only: args.merge_subtitles,
+            upscale: args.upscale,
         };
 
         let rel_str = rel.display().to_string();

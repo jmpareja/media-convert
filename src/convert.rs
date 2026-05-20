@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use crate::backend::Backend;
 use crate::codec::Codec;
 use crate::container::Container;
+use crate::upscale::Upscale;
 
 #[derive(Clone, Debug)]
 pub struct SubtitleInput {
@@ -42,6 +43,10 @@ pub struct EncodeOptions<'a> {
     /// file without burning encoder cycles on a stream we'd otherwise be
     /// passing through unchanged.
     pub merge_only: bool,
+    /// Resize the video to a fixed output resolution. Disabled by default;
+    /// ignored in `merge_only` mode (which stream-copies video without
+    /// touching pixels).
+    pub upscale: Upscale,
 }
 
 pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<Child> {
@@ -118,8 +123,21 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
         // Stream-copy the video; no filter / quality / preset apply.
         cmd.args(["-c:v", "copy"]);
     } else {
-        if let Some(filter) = &cfg.video_filter {
-            cmd.args(["-vf", filter]);
+        // Compose the upscale filter (if any) ahead of the backend's own
+        // filter so the resized frames land in whatever pixel/hwframe layout
+        // the encoder expects. Both halves are optional and either may be
+        // absent for a given (backend, upscale) pair.
+        let combined_filter = match (
+            opts.upscale.filter(opts.backend),
+            cfg.video_filter.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(u), None) => Some(u),
+            (None, Some(b)) => Some(b.to_string()),
+            (Some(u), Some(b)) => Some(format!("{u},{b}")),
+        };
+        if let Some(filter) = combined_filter {
+            cmd.args(["-vf", &filter]);
         }
 
         cmd.args(["-c:v", cfg.encoder]);
@@ -309,6 +327,7 @@ mod tests {
             source_subtitle_codecs: &[],
             unmappable_stream_indices: &[],
             merge_only: false,
+            upscale: Upscale::None,
         }
     }
 
@@ -769,6 +788,82 @@ mod tests {
                 speed: None
             }]
         );
+    }
+
+    fn vf_arg(args: &[String]) -> Option<&str> {
+        let i = args.iter().position(|a| a == "-vf")?;
+        args.get(i + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn upscale_none_emits_no_video_filter_on_software() {
+        // Sanity: default (Upscale::None) on a backend with no native
+        // video_filter (software) means no -vf at all.
+        let cmd = build_ffmpeg_command(
+            Path::new("/in/a.mp4"),
+            Path::new("/out/a.mkv"),
+            &opts_software_x265(),
+        );
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-vf"));
+    }
+
+    #[test]
+    fn upscale_1080p_software_emits_cpu_scale_pad_filter() {
+        let mut opts = opts_software_x265();
+        opts.upscale = Upscale::To1080p;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        let vf = vf_arg(&args).expect("has -vf");
+        assert!(vf.contains("scale=1920:1080:flags=lanczos"));
+        assert!(vf.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2"));
+        assert!(!vf.contains("scale_cuda"));
+    }
+
+    #[test]
+    fn upscale_1080p_nvenc_emits_cuda_scale_with_hwdownload_pad_hwupload() {
+        let mut opts = opts_software_x265();
+        opts.backend = Backend::Nvenc;
+        opts.upscale = Upscale::To1080p;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        let vf = vf_arg(&args).expect("has -vf");
+        assert!(vf.contains("scale_cuda=1920:1080:force_original_aspect_ratio=decrease"));
+        assert!(vf.contains("hwdownload,format=nv12"));
+        assert!(vf.ends_with("hwupload_cuda"));
+    }
+
+    #[test]
+    fn upscale_1080p_vaapi_chains_cpu_scale_before_backend_hwupload() {
+        // VAAPI's backend filter is `format=nv12,hwupload`. With upscaling on,
+        // the CPU scale+pad must come first so the padded frames are what get
+        // moved onto the VAAPI device.
+        let mut opts = opts_software_x265();
+        opts.backend = Backend::Vaapi;
+        opts.upscale = Upscale::To1080p;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mp4"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        let vf = vf_arg(&args).expect("has -vf");
+        let scale_idx = vf.find("scale=1920:1080").expect("has cpu scale");
+        let upload_idx = vf.find("hwupload").expect("has hwupload");
+        assert!(
+            scale_idx < upload_idx,
+            "scale must precede hwupload, got: {vf}"
+        );
+        assert!(vf.contains("format=nv12,hwupload"));
+    }
+
+    #[test]
+    fn merge_only_suppresses_upscale_filter() {
+        // merge_only stream-copies the video — pixels aren't touched, so any
+        // requested upscale must be silently dropped (not just no-op'd).
+        let mut opts = opts_software_x265();
+        opts.merge_only = true;
+        opts.upscale = Upscale::To1080p;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.mkv"), &opts);
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-vf"));
+        assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]));
     }
 
     #[test]
