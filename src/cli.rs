@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use media_convert::backend::Backend;
 use media_convert::codec::Codec;
 use media_convert::container::Container;
+use media_convert::upscale::Upscale;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Re-encode a media library to a target codec")]
@@ -46,6 +47,13 @@ pub struct Cli {
     /// nvenc: p1..p7. qsv: veryfast..veryslow. vaapi: ignored.
     #[arg(long)]
     pub preset: Option<String>,
+
+    /// Output resolution. `none` (default) encodes at the source's native
+    /// resolution; `1080p` scales to 1920x1080 with Lanczos, preserving the
+    /// source aspect ratio (letter/pillarboxed with black where needed).
+    /// Has no effect with --merge-subtitles.
+    #[arg(long, value_enum, default_value_t = Upscale::None)]
+    pub upscale: Upscale,
 
     /// Scan and report what would be converted, without running ffmpeg
     #[arg(long)]

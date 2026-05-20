@@ -15,6 +15,7 @@ use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_
 use media_convert::inhibit::Inhibitor;
 use media_convert::output::{sum_file_sizes, validate_output};
 use media_convert::scan::SidecarSubtitle;
+use media_convert::upscale::Upscale;
 use media_convert::{probe, scan};
 
 const HINT_SOURCE_FOLDER: &str = "Pick a directory to scan for video files. The tree under it is mirrored under the output directory.";
@@ -41,6 +42,10 @@ const HINT_CONTAINER_MP4: &str = "MP4 — universal playback. Subtitles are tran
 
 const HINT_QUALITY: &str = "Quality value (lower = better quality, larger files). The flag and meaningful range depend on the backend: software/nvenc/qsv ~18-30, vaapi -qp ~20-30.";
 const HINT_PRESET: &str = "Encoder preset. libx265: ultrafast..placebo. libsvtav1: 0-13 (lower = slower / better). nvenc: p1..p7. qsv: veryfast..veryslow. vaapi: ignored.";
+
+const HINT_UPSCALE: &str = "Output resolution. `none` keeps the source size; `1080p` scales to 1920x1080 with Lanczos and pads to preserve aspect ratio. Ignored when merge-subtitles is on.";
+const HINT_UPSCALE_NONE: &str = "Encode at the source's native resolution. No scaling, no padding.";
+const HINT_UPSCALE_1080P: &str = "Scale to 1920x1080 with Lanczos, preserving display aspect ratio (letter/pillarboxed with black). Cannot recover detail that isn't in the source — best paired with a slow preset and low quality (cq/crf).";
 
 const HINT_FORCE: &str =
     "Re-encode files even when their video stream is already in the target codec.";
@@ -214,6 +219,7 @@ struct App {
     container: Container,
     quality: u8,
     preset: String,
+    upscale: Upscale,
     force: bool,
     recurse: bool,
     embed_subtitles: bool,
@@ -252,6 +258,7 @@ impl Default for App {
             container: Container::Mkv,
             quality: cfg.default_quality,
             preset: cfg.default_preset.unwrap_or("").to_string(),
+            upscale: Upscale::None,
             force: false,
             recurse: true,
             embed_subtitles: false,
@@ -758,6 +765,7 @@ impl App {
         let container = self.container;
         let quality = self.quality;
         let preset = self.preset.clone();
+        let upscale = self.upscale;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = cancel.clone();
         let current_child = Arc::new(Mutex::new(None::<Child>));
@@ -792,6 +800,7 @@ impl App {
                     source_subtitle_codecs: &entry.source_subtitle_codecs,
                     unmappable_stream_indices: &entry.unmappable_stream_indices,
                     merge_only: merge_subtitles,
+                    upscale,
                 };
                 let result = run_one(
                     &entry.abs,
@@ -1257,6 +1266,25 @@ impl eframe::App for App {
                                             .desired_width(80.0),
                                     )
                                     .on_hover_text(HINT_PRESET);
+                                    ui.end_row();
+
+                                    ui.label("Upscale:").on_hover_text(HINT_UPSCALE);
+                                    egui::ComboBox::from_id_salt("upscale_combo")
+                                        .selected_text(self.upscale.label())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.upscale,
+                                                Upscale::None,
+                                                "none",
+                                            )
+                                            .on_hover_text(HINT_UPSCALE_NONE);
+                                            ui.selectable_value(
+                                                &mut self.upscale,
+                                                Upscale::To1080p,
+                                                "1080p",
+                                            )
+                                            .on_hover_text(HINT_UPSCALE_1080P);
+                                        });
                                     ui.end_row();
                                 });
 

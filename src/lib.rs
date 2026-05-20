@@ -6,3 +6,4 @@ pub mod inhibit;
 pub mod output;
 pub mod probe;
 pub mod scan;
+pub mod upscale;
