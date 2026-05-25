@@ -5,5 +5,6 @@ pub mod convert;
 pub mod inhibit;
 pub mod output;
 pub mod probe;
+pub mod profile;
 pub mod scan;
 pub mod upscale;

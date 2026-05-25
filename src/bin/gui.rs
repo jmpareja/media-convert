@@ -13,7 +13,9 @@ use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{EncodeOptions, SubtitleInput, read_progress, spawn_encode};
 use media_convert::inhibit::Inhibitor;
+use media_convert::output::{hls_output_path, web_output_path};
 use media_convert::output::{sum_file_sizes, validate_output};
+use media_convert::profile::EncodingProfile;
 use media_convert::scan::SidecarSubtitle;
 use media_convert::upscale::Upscale;
 use media_convert::{probe, scan};
@@ -42,6 +44,11 @@ const HINT_CONTAINER_MP4: &str = "MP4 — universal playback. Subtitles are tran
 
 const HINT_QUALITY: &str = "Quality value (lower = better quality, larger files). The flag and meaningful range depend on the backend: software/nvenc/qsv ~18-30, vaapi -qp ~20-30.";
 const HINT_PRESET: &str = "Encoder preset. libx265: ultrafast..placebo. libsvtav1: 0-13 (lower = slower / better). nvenc: p1..p7. qsv: veryfast..veryslow. vaapi: ignored.";
+
+const HINT_PROFILE: &str = "Encoding profile. `standard` honours the codec/backend/container/quality/preset/upscale settings. `web` writes a browser-friendly sibling `<stem>.web.mp4` next to each source. `hls` writes a sibling `<stem>.hls/` HLS bundle (master.m3u8 + 360p/720p/1080p variant playlists and segments) for adaptive streaming.";
+const HINT_PROFILE_STANDARD: &str = "Configurable transcode using the codec/backend/container/quality/preset/upscale fields. Output goes to the chosen output directory.";
+const HINT_PROFILE_WEB: &str = "Fixed H.264 high@4.0 / AAC stereo 192k / MP4 +faststart. Writes a sibling `<stem>.web.mp4` next to each source (the output directory and codec/backend/container/quality/preset/upscale fields are ignored). Use when serving files to a browser-based player.";
+const HINT_PROFILE_HLS: &str = "Fixed HTTP Live Streaming bundle: 360p/720p/1080p H.264 + AAC stereo, master.m3u8 + per-variant playlist.m3u8 + segment_NNN.ts in a sibling `<stem>.hls/` directory. The output directory and codec/backend/container/quality/preset/upscale fields are ignored. Use when serving adaptive video to mobile / web players.";
 
 const HINT_UPSCALE: &str = "Output resolution. `none` keeps the source size; `1080p` scales to 1920x1080 with Lanczos and pads to preserve aspect ratio. Ignored when merge-subtitles is on.";
 const HINT_UPSCALE_NONE: &str = "Encode at the source's native resolution. No scaling, no padding.";
@@ -126,6 +133,23 @@ impl OutputDest {
             OutputDest::PerSource => "(next to each source)".into(),
         }
     }
+}
+
+/// True when `p` should be treated as a directory root (we'd `mkdir -p` it
+/// before writing under it), false when it's a single concrete file target
+/// (parent dir is what matters and is left to ffmpeg's own `create_dir_all`).
+///
+/// Heuristic: an existing directory is obviously a dir; a path with no
+/// extension is interpreted as a dir (matches the CLI's `output_is_filepath`
+/// logic); otherwise it's a file (single-source default sibling case).
+fn looks_like_directory_target(p: &Path) -> bool {
+    if p.is_dir() {
+        return true;
+    }
+    if p.is_file() {
+        return false;
+    }
+    p.extension().is_none()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +238,7 @@ struct Notification {
 struct App {
     sources: Vec<PathBuf>,
     output: Option<OutputDest>,
+    profile: EncodingProfile,
     codec: Codec,
     backend: Backend,
     container: Container,
@@ -253,6 +278,7 @@ impl Default for App {
         Self {
             sources: Vec::new(),
             output: None,
+            profile: EncodingProfile::Standard,
             codec,
             backend,
             container: Container::Mkv,
@@ -288,23 +314,49 @@ impl App {
         self.preset = cfg.default_preset.unwrap_or("").to_string();
     }
 
+    /// Compute the default output destination for the current profile +
+    /// container + source set. Used both when sources are first picked and
+    /// when the profile flips between Standard and Web.
+    ///
+    /// Multiple sources of any kind would collide under a single shared
+    /// output root, so each gets a per-source default. For a single source
+    /// the default is a concrete file path (the user can see exactly where
+    /// the output will land and overwrite it via the picker if they want).
+    fn default_output_dest(&self, sources: &[PathBuf]) -> Option<OutputDest> {
+        if sources.is_empty() {
+            return None;
+        }
+        if sources.len() > 1 {
+            return Some(OutputDest::PerSource);
+        }
+        let single = match self.profile {
+            EncodingProfile::Web => media_convert::output::web_output_path(&sources[0]),
+            EncodingProfile::Hls => media_convert::output::hls_output_path(&sources[0]),
+            EncodingProfile::Standard => {
+                media_convert::output::default_output(&sources[0], self.container)
+            }
+        };
+        Some(OutputDest::Single(single))
+    }
+
     /// Update `self.sources`, and pre-fill `self.output` with a sensible
     /// default if the user hasn't picked one yet. Existing user choices for
     /// output are preserved so the user can override the suggestion.
     fn set_sources(&mut self, sources: Vec<PathBuf>) {
-        if self.output.is_none() && !sources.is_empty() {
-            // Multiple sources of any kind would collide if forced under a single
-            // shared output root, so each gets a per-source default.
-            self.output = Some(if sources.len() > 1 {
-                OutputDest::PerSource
-            } else {
-                OutputDest::Single(media_convert::output::default_output(
-                    &sources[0],
-                    self.container,
-                ))
-            });
+        if self.output.is_none() {
+            self.output = self.default_output_dest(&sources);
         }
         self.sources = sources;
+    }
+
+    /// Called when the user flips the Profile ComboBox. Recomputes the
+    /// default output destination for the new profile so the output field
+    /// reflects what will actually happen (sibling `.web.mp4` for Web,
+    /// `<source>-converted.<ext>` for Standard). Any explicit choice the
+    /// user had made is replaced — the alternative (silently keeping a
+    /// Standard-flavoured path while in Web mode) was the bug we're fixing.
+    fn on_profile_changed(&mut self) {
+        self.output = self.default_output_dest(&self.sources.clone());
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -518,10 +570,15 @@ impl App {
             return;
         }
 
-        // Confirm the output directory is writable before kicking off a scan.
-        // Disk-space warnings happen later (at start_encode) once we know the
-        // total source size.
-        if let OutputDest::Single(p) = &output {
+        // Confirm the output destination is writable before kicking off a
+        // scan. PerSource skips this — each output lives next to its own
+        // source on whatever filesystem that is. Single(path) is validated
+        // as a directory unless `path` is a concrete file (has a non-empty
+        // extension and isn't an existing dir) — in which case we trust
+        // its parent dir to exist (single-source default sibling case).
+        if let OutputDest::Single(p) = &output
+            && looks_like_directory_target(p)
+        {
             match validate_output(p, None) {
                 Ok(v) => {
                     for w in v.warnings {
@@ -539,6 +596,7 @@ impl App {
         self.selected_file_index = None;
 
         let sources = self.sources.clone();
+        let profile = self.profile;
         let codec = self.codec;
         let container = self.container;
         let force = self.force;
@@ -570,11 +628,68 @@ impl App {
                         .unwrap_or(abs.as_path())
                         .to_path_buf();
 
-                    let out = match &output {
-                        OutputDest::PerSource => {
+                    let out = match (profile, &output) {
+                        // Web + PerSource (multi-source default): sibling
+                        // `<stem>.web.mp4` next to each source.
+                        (EncodingProfile::Web, OutputDest::PerSource) => web_output_path(abs),
+                        // Web + Single: if the user kept the auto-default
+                        // (a concrete `.web.mp4` file path), use it verbatim;
+                        // if they picked a directory to override, write
+                        // `<root>/<rel-parent>/<stem>.web.mp4` mirroring the
+                        // source tree underneath.
+                        (EncodingProfile::Web, OutputDest::Single(root)) => {
+                            if looks_like_directory_target(root) {
+                                let stem = abs
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let parent = rel.parent().unwrap_or(Path::new(""));
+                                let name = if stem.is_empty() {
+                                    "web.mp4".to_string()
+                                } else {
+                                    format!("{stem}.web.mp4")
+                                };
+                                root.join(parent).join(name)
+                            } else {
+                                root.clone()
+                            }
+                        }
+                        // HLS + PerSource (multi-source default): sibling
+                        // `<stem>.hls/` bundle next to each source.
+                        (EncodingProfile::Hls, OutputDest::PerSource) => hls_output_path(abs),
+                        // HLS + Single: a Single value here is always a
+                        // directory (the per-source default is itself a
+                        // `<stem>.hls/` directory path, and the picker
+                        // returns directories). Treat any non-`.hls`
+                        // value as a root that we mirror the bundle tree
+                        // underneath.
+                        (EncodingProfile::Hls, OutputDest::Single(root)) => {
+                            // Distinguish the auto-default (`<source-dir>/<stem>.hls`)
+                            // from a user-picked override directory. The
+                            // auto-default already points at the exact
+                            // bundle directory; a picked directory needs
+                            // the source tree mirrored underneath it.
+                            if root.extension().and_then(|e| e.to_str()) == Some("hls") {
+                                root.clone()
+                            } else {
+                                let stem = abs
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let parent = rel.parent().unwrap_or(Path::new(""));
+                                let name = if stem.is_empty() {
+                                    "hls".to_string()
+                                } else {
+                                    format!("{stem}.hls")
+                                };
+                                root.join(parent).join(name)
+                            }
+                        }
+                        // Standard branches: existing behaviour.
+                        (_, OutputDest::PerSource) => {
                             media_convert::output::default_output(abs, container)
                         }
-                        OutputDest::Single(root) => {
+                        (_, OutputDest::Single(root)) => {
                             let mut o = root.join(&rel);
                             o.set_extension(container.extension());
                             o
@@ -622,6 +737,17 @@ impl App {
                                     } else {
                                         Decision::Encode
                                     }
+                                } else if matches!(
+                                    profile,
+                                    EncodingProfile::Web | EncodingProfile::Hls
+                                ) {
+                                    // Source codec alone can't tell whether
+                                    // the file is already a valid web copy
+                                    // or HLS bundle (we'd need profile/level/
+                                    // audio/faststart/segment info too).
+                                    // Always encode if the output doesn't
+                                    // exist.
+                                    Decision::Encode
                                 } else if force || !codec.matches_source(&info.codec) {
                                     Decision::Encode
                                 } else {
@@ -692,9 +818,15 @@ impl App {
 
         // Re-check the output directory now that we know the total source
         // size — this surfaces low-disk-space warnings before we start
-        // burning encoder time. PerSource skips this; each output is on
-        // whatever filesystem its source lives on.
-        if let Some(OutputDest::Single(output)) = self.output.clone() {
+        // burning encoder time. PerSource skips this; each output lives
+        // next to its own source on whatever filesystem that is. A
+        // Single(path) that points at a concrete file (e.g. the Web
+        // profile's sibling default) also skips it — there's no directory
+        // to validate; the parent dir is the source's directory and
+        // already exists.
+        if let Some(OutputDest::Single(output)) = self.output.clone()
+            && looks_like_directory_target(&output)
+        {
             let to_encode_paths: Vec<PathBuf> = self
                 .files
                 .iter()
@@ -760,6 +892,7 @@ impl App {
             return;
         }
 
+        let profile = self.profile;
         let codec = self.codec;
         let backend = self.backend;
         let container = self.container;
@@ -791,6 +924,7 @@ impl App {
                     break;
                 }
                 let opts = EncodeOptions {
+                    profile,
                     codec,
                     backend,
                     container,
@@ -1179,74 +1313,116 @@ impl eframe::App for App {
                             ui.heading("Encoder Settings");
                             let prev_codec = self.codec;
                             let prev_backend = self.backend;
+                            let prev_profile = self.profile;
 
                             egui::Grid::new("encoder_grid")
                                 .num_columns(2)
                                 .spacing([8.0, 8.0])
                                 .show(ui, |ui| {
-                                    ui.label("Codec:").on_hover_text(HINT_CODEC);
-                                    egui::ComboBox::from_id_salt("codec_combo")
-                                        .selected_text(self.codec.label())
+                                    // Profile picker stays at the top of the
+                                    // grid; selecting Web greys out the rest
+                                    // of the encoder fields (they don't apply
+                                    // to the fixed web config).
+                                    ui.label("Profile:").on_hover_text(HINT_PROFILE);
+                                    egui::ComboBox::from_id_salt("profile_combo")
+                                        .selected_text(self.profile.label())
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(
-                                                &mut self.codec,
-                                                Codec::X265,
-                                                "x265",
+                                                &mut self.profile,
+                                                EncodingProfile::Standard,
+                                                "standard",
                                             )
-                                            .on_hover_text(HINT_CODEC_X265);
-                                            ui.selectable_value(&mut self.codec, Codec::Av1, "av1")
-                                                .on_hover_text(HINT_CODEC_AV1);
+                                            .on_hover_text(HINT_PROFILE_STANDARD);
+                                            ui.selectable_value(
+                                                &mut self.profile,
+                                                EncodingProfile::Web,
+                                                "web",
+                                            )
+                                            .on_hover_text(HINT_PROFILE_WEB);
+                                            ui.selectable_value(
+                                                &mut self.profile,
+                                                EncodingProfile::Hls,
+                                                "hls",
+                                            )
+                                            .on_hover_text(HINT_PROFILE_HLS);
                                         });
+                                    ui.end_row();
+
+                                    let configurable = self.profile == EncodingProfile::Standard;
+
+                                    ui.label("Codec:").on_hover_text(HINT_CODEC);
+                                    ui.add_enabled_ui(configurable, |ui| {
+                                        egui::ComboBox::from_id_salt("codec_combo")
+                                            .selected_text(self.codec.label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.codec,
+                                                    Codec::X265,
+                                                    "x265",
+                                                )
+                                                .on_hover_text(HINT_CODEC_X265);
+                                                ui.selectable_value(
+                                                    &mut self.codec,
+                                                    Codec::Av1,
+                                                    "av1",
+                                                )
+                                                .on_hover_text(HINT_CODEC_AV1);
+                                            });
+                                    });
                                     ui.end_row();
 
                                     ui.label("Backend:").on_hover_text(HINT_BACKEND);
-                                    egui::ComboBox::from_id_salt("backend_combo")
-                                        .selected_text(self.backend.label())
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.backend,
-                                                Backend::Software,
-                                                "software",
-                                            )
-                                            .on_hover_text(HINT_BACKEND_SOFTWARE);
-                                            ui.selectable_value(
-                                                &mut self.backend,
-                                                Backend::Nvenc,
-                                                "nvenc",
-                                            )
-                                            .on_hover_text(HINT_BACKEND_NVENC);
-                                            ui.selectable_value(
-                                                &mut self.backend,
-                                                Backend::Qsv,
-                                                "qsv",
-                                            )
-                                            .on_hover_text(HINT_BACKEND_QSV);
-                                            ui.selectable_value(
-                                                &mut self.backend,
-                                                Backend::Vaapi,
-                                                "vaapi",
-                                            )
-                                            .on_hover_text(HINT_BACKEND_VAAPI);
-                                        });
+                                    ui.add_enabled_ui(configurable, |ui| {
+                                        egui::ComboBox::from_id_salt("backend_combo")
+                                            .selected_text(self.backend.label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.backend,
+                                                    Backend::Software,
+                                                    "software",
+                                                )
+                                                .on_hover_text(HINT_BACKEND_SOFTWARE);
+                                                ui.selectable_value(
+                                                    &mut self.backend,
+                                                    Backend::Nvenc,
+                                                    "nvenc",
+                                                )
+                                                .on_hover_text(HINT_BACKEND_NVENC);
+                                                ui.selectable_value(
+                                                    &mut self.backend,
+                                                    Backend::Qsv,
+                                                    "qsv",
+                                                )
+                                                .on_hover_text(HINT_BACKEND_QSV);
+                                                ui.selectable_value(
+                                                    &mut self.backend,
+                                                    Backend::Vaapi,
+                                                    "vaapi",
+                                                )
+                                                .on_hover_text(HINT_BACKEND_VAAPI);
+                                            });
+                                    });
                                     ui.end_row();
 
                                     ui.label("Container:").on_hover_text(HINT_CONTAINER);
-                                    egui::ComboBox::from_id_salt("container_combo")
-                                        .selected_text(self.container.label())
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.container,
-                                                Container::Mkv,
-                                                "mkv",
-                                            )
-                                            .on_hover_text(HINT_CONTAINER_MKV);
-                                            ui.selectable_value(
-                                                &mut self.container,
-                                                Container::Mp4,
-                                                "mp4",
-                                            )
-                                            .on_hover_text(HINT_CONTAINER_MP4);
-                                        });
+                                    ui.add_enabled_ui(configurable, |ui| {
+                                        egui::ComboBox::from_id_salt("container_combo")
+                                            .selected_text(self.container.label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.container,
+                                                    Container::Mkv,
+                                                    "mkv",
+                                                )
+                                                .on_hover_text(HINT_CONTAINER_MKV);
+                                                ui.selectable_value(
+                                                    &mut self.container,
+                                                    Container::Mp4,
+                                                    "mp4",
+                                                )
+                                                .on_hover_text(HINT_CONTAINER_MP4);
+                                            });
+                                    });
                                     ui.end_row();
 
                                     let cfg = self.backend.config(self.codec);
@@ -1255,13 +1431,16 @@ impl eframe::App for App {
                                         cfg.quality_flag.trim_start_matches('-')
                                     ))
                                     .on_hover_text(HINT_QUALITY);
-                                    ui.add(egui::Slider::new(&mut self.quality, 0..=63))
-                                        .on_hover_text(HINT_QUALITY);
+                                    ui.add_enabled(
+                                        configurable,
+                                        egui::Slider::new(&mut self.quality, 0..=63),
+                                    )
+                                    .on_hover_text(HINT_QUALITY);
                                     ui.end_row();
 
                                     ui.label("Preset:").on_hover_text(HINT_PRESET);
                                     ui.add_enabled(
-                                        cfg.default_preset.is_some(),
+                                        configurable && cfg.default_preset.is_some(),
                                         egui::TextEdit::singleline(&mut self.preset)
                                             .desired_width(80.0),
                                     )
@@ -1269,27 +1448,32 @@ impl eframe::App for App {
                                     ui.end_row();
 
                                     ui.label("Upscale:").on_hover_text(HINT_UPSCALE);
-                                    egui::ComboBox::from_id_salt("upscale_combo")
-                                        .selected_text(self.upscale.label())
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.upscale,
-                                                Upscale::None,
-                                                "none",
-                                            )
-                                            .on_hover_text(HINT_UPSCALE_NONE);
-                                            ui.selectable_value(
-                                                &mut self.upscale,
-                                                Upscale::To1080p,
-                                                "1080p",
-                                            )
-                                            .on_hover_text(HINT_UPSCALE_1080P);
-                                        });
+                                    ui.add_enabled_ui(configurable, |ui| {
+                                        egui::ComboBox::from_id_salt("upscale_combo")
+                                            .selected_text(self.upscale.label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.upscale,
+                                                    Upscale::None,
+                                                    "none",
+                                                )
+                                                .on_hover_text(HINT_UPSCALE_NONE);
+                                                ui.selectable_value(
+                                                    &mut self.upscale,
+                                                    Upscale::To1080p,
+                                                    "1080p",
+                                                )
+                                                .on_hover_text(HINT_UPSCALE_1080P);
+                                            });
+                                    });
                                     ui.end_row();
                                 });
 
                             if self.codec != prev_codec || self.backend != prev_backend {
                                 self.reset_to_backend_defaults();
+                            }
+                            if self.profile != prev_profile {
+                                self.on_profile_changed();
                             }
                         });
                     });
@@ -1316,9 +1500,14 @@ impl eframe::App for App {
                                 )
                                 .on_hover_text(HINT_EMBED_SUBTITLES);
                                 ui.separator();
-                                ui.checkbox(
-                                    &mut self.merge_subtitles,
-                                    "Merge subtitles only (no re-encode)",
+                                // Web profile re-encodes the video by design,
+                                // so merge-only would be self-contradictory.
+                                ui.add_enabled(
+                                    self.profile == EncodingProfile::Standard,
+                                    egui::Checkbox::new(
+                                        &mut self.merge_subtitles,
+                                        "Merge subtitles only (no re-encode)",
+                                    ),
                                 )
                                 .on_hover_text(HINT_MERGE_SUBTITLES);
                             });

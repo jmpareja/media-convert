@@ -3,7 +3,10 @@
 Re-encode a media library to a target codec (HEVC/x265 or AV1), preserving the
 source directory tree. Ships as a CLI and an egui-based GUI. Supports CPU
 encoding (best compression) and three hardware backends, output to MKV or MP4,
-and optional embedding of sidecar `.srt` subtitle files.
+and optional embedding of sidecar `.srt` subtitle files. Two extra profiles
+target streaming-app fast paths: `--profile web` produces a browser-friendly
+`<stem>.web.mp4` sibling next to each source, and `--profile hls` produces a
+`<stem>.hls/` HLS bundle (master + 360p/720p/1080p variants).
 
 ## Requirements
 
@@ -99,6 +102,7 @@ Common flags:
 |---|---|
 | `-s, --source <path>` | Source directory or single video file |
 | `-o, --output <path>` | Output directory (default: `<source>-converted` sibling) |
+| `--profile <standard\|web\|hls>` | `standard` (default) honours the flags below. `web` writes a browser-friendly `<stem>.web.mp4` next to each source (libx264 high@4.0 / AAC stereo 192k / MP4 +faststart). `hls` writes a `<stem>.hls/` HLS bundle (master + 360p/720p/1080p variant playlists and TS segments). `web` and `hls` ignore `--codec`, `--backend`, `--container`, `--quality`, `--preset`, `--upscale`; `--output` defaults to next-to-source but can be overridden to a different root. |
 | `-c, --codec <x265\|av1>` | Target codec (default `x265`) |
 | `-b, --backend <software\|nvenc\|qsv\|vaapi>` | Encoder backend (default `software`) |
 | `--container <mkv\|mp4>` | Output container (default `mkv`) |
@@ -135,6 +139,14 @@ media-convert -s ~/Videos -o ~/Videos-merged --merge-subtitles
 
 # Preview only — no encoding
 media-convert -s ~/Videos -o ~/Videos-x265 --dry-run
+
+# Produce a browser-friendly sibling for each source on the NAS:
+#   /mnt/jmp-titan0/tv/Show/S01/ep1.mkv  →  ep1.web.mp4 in the same directory
+media-convert -s /mnt/jmp-titan0/tv --profile web
+
+# Produce an HLS bundle (master.m3u8 + 360p/720p/1080p) next to each source:
+#   /mnt/jmp-titan0/tv/Show/S01/ep1.mkv  →  ep1.hls/ in the same directory
+media-convert -s /mnt/jmp-titan0/tv --profile hls
 ```
 
 ## GUI
@@ -231,6 +243,71 @@ extra tracks. The discovery rules:
 - Or whose stem starts with `<video-stem>.<lang>`, e.g. `movie.en.srt`,
   `movie.ger.srt`. Two- or three-letter ASCII codes are tagged as the
   subtitle's `language` metadata.
+
+## HLS profile
+
+`--profile hls` is an operating mode for adaptive HTTP Live Streaming. It
+writes a sibling directory next to each source:
+
+```
+input:  /path/to/<rel>/<name>.<ext>
+output: /path/to/<rel>/<name>.hls/
+        ├── master.m3u8
+        ├── 360p/playlist.m3u8 + segment_NNN.ts
+        ├── 720p/playlist.m3u8 + segment_NNN.ts
+        └── 1080p/playlist.m3u8 + segment_NNN.ts
+```
+
+The bundle is a fixed configuration aimed at the streaming-app fast path:
+
+- Renditions (ladder): 360p @ 800 kbps (H.264 main 3.0), 720p @ 2.8 Mbps
+  (H.264 main 3.1), 1080p @ 5 Mbps (H.264 high 4.0). Width auto-tracks the
+  source aspect ratio (`scale=-2:N`).
+- Audio: AAC stereo per variant — 96 kbps at 360p, 128 kbps at 720p and
+  1080p.
+- Segments: 6-second MPEG-TS, keyframes forced on segment boundaries via
+  `-force_key_frames`, `independent_segments` set so the player can switch
+  renditions on any segment.
+- Master playlist: written by ffmpeg's HLS muxer at `<bundle>/master.m3u8`
+  with the variant entries it has actual bitrate/resolution data for.
+
+Outputs go next to each source by default; pass `--output <root>` to mirror
+the source tree underneath a different directory (e.g. for serving from a
+separate HTTP root). The `--codec`, `--backend`, `--container`,
+`--quality`, `--preset`, and `--upscale` flags are ignored — the ladder is
+fixed. `--profile hls` is mutually exclusive with `--merge-subtitles`.
+Subtitles in the source are not muxed into the HLS bundle; pair with a
+separate sidecar WebVTT step if you need captions.
+
+## Web profile
+
+`--profile web` is a separate operating mode aimed at producing a
+browser-friendly copy of each source for a streaming-app fast-path
+resolver. It is a fixed configuration — none of the codec / backend /
+container / quality / preset / upscale knobs apply — and outputs go next
+to each source instead of into `--output`:
+
+```
+input:  /path/to/<rel>/<name>.<ext>
+output: /path/to/<rel>/<name>.web.mp4
+```
+
+The encoder settings (also exposed in the GUI as a `Profile: web`
+ComboBox):
+
+- Container: MP4 with `-movflags +faststart` (moov atom at file start, so
+  playback can begin before the file is fully buffered).
+- Video: libx264, `-preset slow -crf 20 -profile:v high -level 4.0
+  -pix_fmt yuv420p`.
+- Audio: AAC, stereo downmix (`-ac 2`), 192 kbps. Replaces source audio
+  codecs like E-AC-3 / AC-3 that most browsers won't decode.
+- Subtitles: text subs are transcoded to `mov_text`; image-based subs
+  (PGS, DVB) are dropped (an unavoidable MP4 limitation).
+
+The "already in target codec" probe-skip is disabled — re-encoding the
+file is the whole point — but files whose `.web.mp4` sibling already
+exists are still skipped (delete the sibling and re-run to redo one).
+`--profile web` is mutually exclusive with `--merge-subtitles`.
 
 ### Merge subtitles without re-encoding
 

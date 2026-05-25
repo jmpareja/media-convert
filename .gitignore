@@ -1,1 +1,8 @@
 /target
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Antigravity
+.antigravitycli/

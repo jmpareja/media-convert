@@ -80,11 +80,35 @@ pub fn find_videos(root: &Path, recursive: bool) -> Vec<PathBuf> {
     }
     walker
         .into_iter()
+        // Prune media-convert's own output bundles so re-running the tool on
+        // a tree doesn't pick its previous outputs up as fresh sources.
+        // `.hls/` directories are HLS bundle roots — walk would otherwise
+        // descend and find each `.ts` segment as a "video" and re-encode
+        // it. `filter_entry` prunes whole subtrees, so children of `.hls/`
+        // are never enumerated.
+        .filter_entry(|e| !is_hls_bundle_dir(e.path()))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .filter(|p| is_video(p))
+        // `.web.mp4` files are the Web profile's own outputs — same logic.
+        // Recognising them by the trailing `.web.mp4` keeps the rule scoped
+        // to our convention rather than excluding all `.mp4`.
+        .filter(|p| !is_web_sibling(p))
         .collect()
+}
+
+fn is_hls_bundle_dir(p: &Path) -> bool {
+    p.is_dir()
+        && p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("hls"))
+}
+
+fn is_web_sibling(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".web.mp4"))
 }
 
 pub fn is_video(path: &Path) -> bool {
@@ -270,5 +294,45 @@ mod tests {
     fn is_video_returns_false_for_path_without_extension() {
         assert!(!is_video(Path::new("README")));
         assert!(!is_video(Path::new("/some/path/file")));
+    }
+
+    #[test]
+    fn find_videos_prunes_dot_hls_bundle_directories() {
+        // Reproduce the recursive-bundle bug: a previous --profile hls run
+        // left `.hls/` directories full of `.ts` segments. A fresh scan
+        // must not descend into them, otherwise each segment gets treated
+        // as a new source and the tree grows on every run.
+        let dir = tempdir().unwrap();
+        let mkv = dir.path().join("Show/S01/ep1.mkv");
+        fs::create_dir_all(mkv.parent().unwrap()).unwrap();
+        fs::write(&mkv, b"").unwrap();
+        let bundle = dir.path().join("Show/S01/ep1.hls/720p");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("segment_000.ts"), b"").unwrap();
+        fs::write(bundle.join("segment_001.ts"), b"").unwrap();
+
+        let videos = find_videos(dir.path(), true);
+        assert_eq!(videos.len(), 1, "expected only ep1.mkv, got {videos:?}");
+        assert!(videos[0].ends_with("ep1.mkv"));
+    }
+
+    #[test]
+    fn find_videos_skips_dot_web_mp4_siblings() {
+        // Web profile's own outputs (`<stem>.web.mp4`) live next to the
+        // sources they were generated from. A re-scan must skip them so
+        // we don't try to web-encode them into `<stem>.web.web.mp4`.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("ep1.mkv"), b"").unwrap();
+        fs::write(dir.path().join("ep1.web.mp4"), b"").unwrap();
+        // A regular `.mp4` that isn't ours should still be picked up.
+        fs::write(dir.path().join("ep2.mp4"), b"").unwrap();
+
+        let mut videos = find_videos(dir.path(), true);
+        videos.sort();
+        let names: Vec<_> = videos
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["ep1.mkv", "ep2.mp4"]);
     }
 }

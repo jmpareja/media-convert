@@ -11,45 +11,81 @@ use media_convert::codec::Codec;
 use media_convert::container::Container;
 use media_convert::convert::{self, EncodeOptions};
 use media_convert::inhibit::Inhibitor;
-use media_convert::output::{default_output, sum_file_sizes, validate_output};
+use media_convert::output::{
+    default_output, hls_output_path, sum_file_sizes, validate_output, web_output_path,
+};
+use media_convert::profile::EncodingProfile;
 use media_convert::{probe, scan};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
     let single_file_mode = validate(&args)?;
+    let web = args.profile == EncodingProfile::Web;
+    let hls = args.profile == EncodingProfile::Hls;
+    // Bundle profiles (Web, HLS) compute outputs from the source path
+    // (sibling-by-default) and ignore --codec/--backend/--container
+    // entirely. Each one's default is per-source, so the validate /
+    // probe / decide steps differ from a Standard run.
+    let bundle = web || hls;
 
-    let output_root: PathBuf = args
-        .output
-        .clone()
-        .unwrap_or_else(|| default_output(&args.source, args.container));
-    if args.output.is_none() {
-        println!(
-            "--output not given; defaulting to {}",
-            output_root.display()
-        );
-    }
-    if output_root.exists() && !output_root.is_dir() && !single_file_mode {
-        bail!(
-            "--output exists and is not a directory: {}",
-            output_root.display()
-        );
-    }
+    // Bundle profiles default outputs to siblings next to each source;
+    // --output is honoured if given. For Web a `--output` file path is
+    // the exact output (single-file mode); for HLS a `--output` is
+    // always treated as a directory root because the output is itself
+    // a directory.
+    let bundle_output_root: Option<PathBuf> = if bundle { args.output.clone() } else { None };
+    let output_root: PathBuf = if bundle {
+        bundle_output_root.clone().unwrap_or_default()
+    } else {
+        let root = args
+            .output
+            .clone()
+            .unwrap_or_else(|| default_output(&args.source, args.container));
+        if args.output.is_none() {
+            println!("--output not given; defaulting to {}", root.display());
+        }
+        if root.exists() && !root.is_dir() && !single_file_mode {
+            bail!("--output exists and is not a directory: {}", root.display());
+        }
+        root
+    };
 
     let videos = scan::find_videos(&args.source, !args.no_recurse);
     if videos.is_empty() {
         println!("no video files found under {}", args.source.display());
         return Ok(());
     }
-    println!(
-        "found {} candidate file(s); target codec: {}",
-        videos.len(),
-        args.codec.label()
-    );
+    if web {
+        println!(
+            "found {} candidate file(s); profile: web (sibling .web.mp4)",
+            videos.len()
+        );
+    } else if hls {
+        println!(
+            "found {} candidate file(s); profile: hls (sibling .hls/ bundle)",
+            videos.len()
+        );
+    } else {
+        println!(
+            "found {} candidate file(s); target codec: {}",
+            videos.len(),
+            args.codec.label()
+        );
+    }
 
-    // Skip the output-dir validation when the user is writing a single file
-    // to an explicit filepath (we'd be creating a parent dir, not the
-    // filepath itself, and ffmpeg handles that on demand).
-    let validate_output_dir = !(single_file_mode && output_is_filepath(&output_root));
+    // Skip the output-dir validation when the user is writing a single
+    // file to an explicit filepath (we'd be creating a parent dir, not the
+    // filepath itself, and ffmpeg handles that on demand). In bundle
+    // modes skip unless the user passed --output pointing at a real
+    // directory root — per-source siblings live next to their sources,
+    // so there's no shared root to validate. HLS's `--output` is always
+    // a directory root (the output is itself a directory).
+    let bundle_root_is_dir = (web || hls)
+        && bundle_output_root
+            .as_deref()
+            .is_some_and(|p| hls || !output_is_filepath(p));
+    let validate_output_dir =
+        bundle_root_is_dir || !(bundle || single_file_mode && output_is_filepath(&output_root));
     if validate_output_dir && !args.dry_run {
         let total = sum_file_sizes(&videos);
         let v = validate_output(&output_root, Some(total))
@@ -91,7 +127,26 @@ fn main() -> Result<()> {
 
     for (idx, input) in videos.iter().enumerate() {
         let rel = input.strip_prefix(&rel_root).unwrap_or(input).to_path_buf();
-        let output = if single_file_mode && output_is_filepath(&output_root) {
+        let output = if web {
+            match bundle_output_root.as_deref() {
+                // --output was a file path; only meaningful for single-file
+                // source mode. Use it verbatim.
+                Some(root) if output_is_filepath(root) => root.to_path_buf(),
+                // --output was a directory root: mirror `rel` underneath
+                // and append `.web.mp4`.
+                Some(root) => web_output_under_root(root, &rel),
+                // No --output: sibling next to the source.
+                None => web_output_path(input),
+            }
+        } else if hls {
+            match bundle_output_root.as_deref() {
+                // HLS output is itself a directory; a --output value
+                // must be a directory root that contains mirrored
+                // `<stem>.hls/` bundles.
+                Some(root) => hls_output_under_root(root, &rel),
+                None => hls_output_path(input),
+            }
+        } else if single_file_mode && output_is_filepath(&output_root) {
             output_root.clone()
         } else {
             output_path(&output_root, &rel, args.container)
@@ -105,7 +160,12 @@ fn main() -> Result<()> {
             continue;
         }
 
-        if !args.merge_subtitles {
+        // The "already in target codec" check uses ffprobe's codec_name —
+        // not enough to tell whether a file is already a valid web copy
+        // or HLS bundle (we'd also need to verify profile, level, audio
+        // codec, faststart, segment layout etc.). Just re-encode unless
+        // the sibling already exists.
+        if !args.merge_subtitles && !bundle {
             match decide(input, args.codec, args.force) {
                 Ok(Decision::Skip(reason)) => {
                     println!("{prefix} skip ({reason}): {}", rel.display());
@@ -175,6 +235,7 @@ fn main() -> Result<()> {
         }
 
         let opts = EncodeOptions {
+            profile: args.profile,
             codec: args.codec,
             backend: args.backend,
             container: args.container,
@@ -249,6 +310,19 @@ fn validate(args: &Cli) -> Result<bool> {
     require_on_path("ffmpeg")?;
     require_on_path("ffprobe")?;
 
+    if args.profile == EncodingProfile::Web && args.merge_subtitles {
+        bail!(
+            "--profile web is incompatible with --merge-subtitles: web mode re-encodes the video, \
+             while merge-subtitles stream-copies it. Pick one."
+        );
+    }
+    if args.profile == EncodingProfile::Hls && args.merge_subtitles {
+        bail!(
+            "--profile hls is incompatible with --merge-subtitles: hls mode re-encodes a full \
+             rendition ladder, while merge-subtitles stream-copies the video. Pick one."
+        );
+    }
+
     if let Some(q) = args.quality
         && q > 63
     {
@@ -280,6 +354,41 @@ fn require_on_path(prog: &str) -> Result<()> {
         .status()
         .map(|_| ())
         .with_context(|| format!("`{prog}` not found on PATH; install ffmpeg first"))
+}
+
+/// HLS-profile equivalent of `output_path`: place the source's `rel` path
+/// underneath `root` with the basename swapped to `<stem>.hls/` so callers
+/// get a mirrored bundle tree under their chosen output root.
+fn hls_output_under_root(root: &Path, rel: &Path) -> PathBuf {
+    let stem = rel
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let name = if stem.is_empty() {
+        "hls".to_string()
+    } else {
+        format!("{stem}.hls")
+    };
+    root.join(parent).join(name)
+}
+
+/// Web-profile equivalent of `output_path`: write the source's `rel` path
+/// underneath `root` with the extension swapped to `.web.mp4`. Mirrors the
+/// source tree so callers get parallel structure under their chosen
+/// output root.
+fn web_output_under_root(root: &Path, rel: &Path) -> PathBuf {
+    let stem = rel
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let name = if stem.is_empty() {
+        "web.mp4".to_string()
+    } else {
+        format!("{stem}.web.mp4")
+    };
+    root.join(parent).join(name)
 }
 
 fn output_path(output_root: &Path, rel: &Path, container: Container) -> PathBuf {
@@ -358,5 +467,49 @@ mod tests {
             Container::Mp4,
         );
         assert_eq!(out, PathBuf::from("/out/show/episode.mp4"));
+    }
+
+    #[test]
+    fn web_output_under_root_mirrors_source_tree_and_swaps_extension() {
+        let out = web_output_under_root(Path::new("/web"), Path::new("Show/S01/ep1.mkv"));
+        assert_eq!(out, PathBuf::from("/web/Show/S01/ep1.web.mp4"));
+    }
+
+    #[test]
+    fn web_output_under_root_preserves_dotted_basenames() {
+        let out = web_output_under_root(
+            Path::new("/web"),
+            Path::new("Show/Game.of.Thrones.S01E01.1080p.x265.mkv"),
+        );
+        assert_eq!(
+            out,
+            PathBuf::from("/web/Show/Game.of.Thrones.S01E01.1080p.x265.web.mp4")
+        );
+    }
+
+    #[test]
+    fn web_output_under_root_handles_bare_filename() {
+        // Source had no parent dir in `rel` (rel_root == source.parent()) —
+        // output goes directly under the root.
+        let out = web_output_under_root(Path::new("/web"), Path::new("ep1.mkv"));
+        assert_eq!(out, PathBuf::from("/web/ep1.web.mp4"));
+    }
+
+    #[test]
+    fn hls_output_under_root_mirrors_source_tree_to_dot_hls_dirs() {
+        let out = hls_output_under_root(Path::new("/hls"), Path::new("Show/S01/ep1.mkv"));
+        assert_eq!(out, PathBuf::from("/hls/Show/S01/ep1.hls"));
+    }
+
+    #[test]
+    fn hls_output_under_root_preserves_dotted_basenames() {
+        let out = hls_output_under_root(
+            Path::new("/hls"),
+            Path::new("Show/Game.of.Thrones.S01E01.1080p.x265.mkv"),
+        );
+        assert_eq!(
+            out,
+            PathBuf::from("/hls/Show/Game.of.Thrones.S01E01.1080p.x265.hls")
+        );
     }
 }

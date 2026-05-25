@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use crate::backend::Backend;
 use crate::codec::Codec;
 use crate::container::Container;
+use crate::profile::{EncodingProfile, HLS_SEGMENT_SECONDS, hls_variants, web_encoder_args};
 use crate::upscale::Upscale;
 
 #[derive(Clone, Debug)]
@@ -16,6 +17,11 @@ pub struct SubtitleInput {
 }
 
 pub struct EncodeOptions<'a> {
+    /// Top-level transcoding mode. `Standard` honors the configurable
+    /// codec/backend/container/quality/preset/upscale fields below; `Web`
+    /// ignores them all and emits a fixed browser-friendly H.264/AAC/MP4
+    /// `+faststart` configuration.
+    pub profile: EncodingProfile,
     pub codec: Codec,
     pub backend: Backend,
     pub container: Container,
@@ -41,31 +47,64 @@ pub struct EncodeOptions<'a> {
     /// suppress any backend-specific preamble / filter / quality flag, and
     /// just remux. Used by `--merge-subtitles` to add subtitle tracks to a
     /// file without burning encoder cycles on a stream we'd otherwise be
-    /// passing through unchanged.
+    /// passing through unchanged. Only meaningful for the Standard profile;
+    /// Web ignores it (validated at the CLI/GUI layer).
     pub merge_only: bool,
     /// Resize the video to a fixed output resolution. Disabled by default;
     /// ignored in `merge_only` mode (which stream-copies video without
-    /// touching pixels).
+    /// touching pixels) and in the Web profile (which has its own fixed
+    /// pixel pipeline).
     pub upscale: Upscale,
 }
 
 pub fn spawn_encode(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<Child> {
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
+    prepare_output_dirs(output, opts.profile)?;
     let mut cmd = build_ffmpeg_command(input, output, opts);
     cmd.stdout(Stdio::piped());
     cmd.spawn()
         .context("failed to invoke ffmpeg (is it installed and on PATH?)")
 }
 
+/// Ensure the directories ffmpeg is about to write into already exist.
+///
+/// Standard/Web produce a single file, so we just create the file's parent
+/// directory if it isn't already there. HLS produces a directory bundle —
+/// the `.hls` root and one subdirectory per variant — and ffmpeg's HLS
+/// muxer does not auto-create these.
+fn prepare_output_dirs(output: &Path, profile: EncodingProfile) -> Result<()> {
+    match profile {
+        EncodingProfile::Standard | EncodingProfile::Web => {
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+        }
+        EncodingProfile::Hls => {
+            std::fs::create_dir_all(output)
+                .with_context(|| format!("failed to create {}", output.display()))?;
+            for v in hls_variants() {
+                let sub = output.join(v.name);
+                std::fs::create_dir_all(&sub)
+                    .with_context(|| format!("failed to create {}", sub.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Construct the `ffmpeg` invocation for this encode without spawning.
 /// Extracted from `spawn_encode` so its argument layout can be unit-tested.
 pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOptions) -> Command {
+    if opts.profile == EncodingProfile::Hls {
+        return build_hls_command(input, output);
+    }
     let cfg = opts.backend.config(opts.codec);
     let quality = opts.quality.to_string();
     let effective_preset: Option<&str> = opts.preset.or(cfg.default_preset);
+    let web = opts.profile == EncodingProfile::Web;
+    // Web is its own fixed pixel pipeline; the configurable upscale/preset/
+    // quality/backend knobs don't apply.
+    let video_passthrough = opts.merge_only && !web;
 
     let mut cmd = Command::new("ffmpeg");
     cmd.args([
@@ -86,8 +125,9 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
 
     // Skip backend init (hwaccel, vaapi_device) in merge-only mode — we're
     // not touching the video stream, so bringing up the GPU just to remux
-    // would be pure overhead.
-    if !opts.merge_only {
+    // would be pure overhead. Also skip in Web mode, which is CPU-only
+    // libx264 and doesn't use the configured backend.
+    if !video_passthrough && !web {
         for a in &cfg.preamble {
             cmd.arg(a);
         }
@@ -98,7 +138,9 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
         cmd.arg("-i").arg(file_protocol_arg(&sub.path));
     }
 
-    match opts.container {
+    // Web is always MP4-on-output; otherwise honor the configured container.
+    let effective_container = if web { Container::Mp4 } else { opts.container };
+    match effective_container {
         Container::Mkv => {
             cmd.args(["-map", "0"]);
         }
@@ -119,9 +161,17 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
         cmd.arg("-map").arg(format!("{}", i + 1));
     }
 
-    if opts.merge_only {
+    if video_passthrough {
         // Stream-copy the video; no filter / quality / preset apply.
         cmd.args(["-c:v", "copy"]);
+    } else if web {
+        // Fixed encoder fragment lives in profile::web_encoder_args(). It
+        // covers video (libx264 high@4.0 CRF 20 yuv420p), audio (aac stereo
+        // 192k) and `-movflags +faststart` in one place. Audio is included
+        // here, so the post-block `-c:a copy` is suppressed below.
+        for a in web_encoder_args() {
+            cmd.arg(a);
+        }
     } else {
         // Compose the upscale filter (if any) ahead of the backend's own
         // filter so the resized frames land in whatever pixel/hwframe layout
@@ -152,8 +202,12 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
         }
     }
 
-    cmd.args(["-c:a", "copy"]);
-    match opts.container {
+    // Web sets its own audio codec inside web_encoder_args(); for all other
+    // modes the audio stream copies through.
+    if !web {
+        cmd.args(["-c:a", "copy"]);
+    }
+    match effective_container {
         Container::Mkv => {
             // Pick a per-stream subtitle codec for each known source sub:
             // `mov_text` (MP4 timed text) isn't accepted by the matroska
@@ -191,6 +245,135 @@ pub(crate) fn build_ffmpeg_command(input: &Path, output: &Path, opts: &EncodeOpt
     }
 
     cmd.arg(file_protocol_arg(output));
+    cmd
+}
+
+/// Construct the `ffmpeg` invocation for an HLS bundle: one ABR ladder of
+/// video renditions plus matching AAC stereo audio, packaged into a
+/// `master.m3u8` + per-variant `playlist.m3u8` + TS segments tree under
+/// `output`. The output directory and per-variant subdirectories are
+/// created by [`prepare_output_dirs`] before this command runs.
+///
+/// Sub-arguments (per rendition `i`):
+/// * `-map "[vN]"`              the scaled-then-tagged video stream
+/// * `-c:v:i libx264`           CPU x264 (HLS portability before HEVC)
+/// * `-b:v:i / -maxrate:v:i / -bufsize:v:i` from `hls_variants()`
+/// * `-profile:v:i / -level:v:i` likewise
+/// * `-preset slow -pix_fmt yuv420p` shared
+/// * `-force_key_frames "expr:gte(t,n_forced*6)"` aligns keyframes
+///   with the HLS segment boundary so each `.ts` starts on an I-frame
+///
+/// `var_stream_map` ties each `v:i` to its `a:i` and the variant folder
+/// name; the positional output template `…/%v/playlist.m3u8` plus
+/// `-hls_segment_filename …/%v/segment_%03d.ts` lays out the tree.
+fn build_hls_command(input: &Path, output: &Path) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-n",
+        "-ignore_unknown",
+    ]);
+    cmd.arg("-i").arg(file_protocol_arg(input));
+
+    let variants = hls_variants();
+    // filter_complex: split the video N ways and scale each branch to the
+    // variant's height (width auto-tracks source aspect ratio at multiples
+    // of 2). Tag every output so `-map "[v360]"` style refs resolve.
+    let mut filter = format!("[0:v]split={}", variants.len());
+    for v in variants {
+        filter.push_str(&format!("[v{}in]", v.name));
+    }
+    filter.push(';');
+    let last = variants.len() - 1;
+    for (i, v) in variants.iter().enumerate() {
+        filter.push_str(&format!(
+            "[v{name}in]scale=-2:{h}:flags=lanczos,setsar=1[v{name}]",
+            name = v.name,
+            h = v.height,
+        ));
+        if i != last {
+            filter.push(';');
+        }
+    }
+    cmd.args(["-filter_complex", &filter]);
+
+    let gop_expr = format!("expr:gte(t,n_forced*{HLS_SEGMENT_SECONDS})");
+
+    // Per-rendition video + audio output blocks. Each maps the scaled
+    // video and the source's first audio stream, then sets codec /
+    // bitrate / profile / level options scoped to that output stream
+    // index (`:v:i` / `:a:i`).
+    for (i, v) in variants.iter().enumerate() {
+        cmd.arg("-map").arg(format!("[v{}]", v.name));
+        cmd.arg("-map").arg("0:a:0?");
+
+        let vi = format!(":v:{i}");
+        let ai = format!(":a:{i}");
+
+        cmd.args([&format!("-c{vi}"), "libx264"]);
+        cmd.args([&format!("-b{vi}"), v.video_bitrate]);
+        cmd.args([&format!("-maxrate{vi}"), v.video_maxrate]);
+        cmd.args([&format!("-bufsize{vi}"), v.video_bufsize]);
+        cmd.args([&format!("-profile{vi}"), v.video_profile]);
+        cmd.args([&format!("-level{vi}"), v.video_level]);
+        cmd.args([&format!("-force_key_frames{vi}"), &gop_expr]);
+
+        cmd.args([&format!("-c{ai}"), "aac"]);
+        cmd.args([&format!("-ac{ai}"), "2"]);
+        cmd.args([&format!("-b{ai}"), v.audio_bitrate]);
+    }
+
+    // Shared across all video outputs. `-preset slow` is libx264's quality/
+    // speed tradeoff; `-pix_fmt yuv420p` keeps the chroma layout that every
+    // HLS player accepts; `-sc_threshold 0` disables scene-cut keyframes so
+    // the only I-frames are the ones force_key_frames already places.
+    cmd.args([
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        "-sc_threshold",
+        "0",
+    ]);
+
+    // `var_stream_map` ties each (v:i, a:i) pair to a folder name. The
+    // string format is a comma list of stream specs per variant, with
+    // variants separated by spaces. ffmpeg substitutes `%v` in the
+    // output filenames with the corresponding `name:`.
+    let mut var_map = String::new();
+    for (i, v) in variants.iter().enumerate() {
+        if i != 0 {
+            var_map.push(' ');
+        }
+        var_map.push_str(&format!("v:{i},a:{i},name:{}", v.name));
+    }
+
+    let seg_template = output.join("%v").join("segment_%03d.ts");
+    let playlist_template = output.join("%v").join("playlist.m3u8");
+
+    cmd.args([
+        "-f",
+        "hls",
+        "-hls_time",
+        &HLS_SEGMENT_SECONDS.to_string(),
+        "-hls_playlist_type",
+        "vod",
+        "-hls_flags",
+        "independent_segments",
+        "-hls_segment_type",
+        "mpegts",
+        "-hls_list_size",
+        "0",
+    ]);
+    cmd.arg("-hls_segment_filename").arg(&seg_template);
+    cmd.args(["-master_pl_name", "master.m3u8"]);
+    cmd.args(["-var_stream_map", &var_map]);
+    cmd.arg(&playlist_template);
     cmd
 }
 
@@ -318,6 +501,7 @@ mod tests {
 
     fn opts_software_x265() -> EncodeOptions<'static> {
         EncodeOptions {
+            profile: EncodingProfile::Standard,
             codec: Codec::X265,
             backend: Backend::Software,
             container: Container::Mkv,
@@ -925,5 +1109,276 @@ mod tests {
         // Audio still copies; video is the only thing that switched to copy
         // mode (audio was already copy in normal mode, so this reaffirms it).
         assert!(args.windows(2).any(|w| w == ["-c:a", "copy"]));
+    }
+
+    fn opts_web() -> EncodeOptions<'static> {
+        let mut opts = opts_software_x265();
+        opts.profile = EncodingProfile::Web;
+        opts
+    }
+
+    #[test]
+    fn web_profile_emits_libx264_high_level40_yuv420p() {
+        let cmd = build_ffmpeg_command(
+            Path::new("/in/a.mkv"),
+            Path::new("/out/a.web.mp4"),
+            &opts_web(),
+        );
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-c:v", "libx264"]));
+        assert!(args.windows(2).any(|w| w == ["-profile:v", "high"]));
+        assert!(args.windows(2).any(|w| w == ["-level", "4.0"]));
+        assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv420p"]));
+        assert!(args.windows(2).any(|w| w == ["-crf", "20"]));
+        assert!(args.windows(2).any(|w| w == ["-preset", "slow"]));
+    }
+
+    #[test]
+    fn web_profile_emits_aac_stereo_192k_overriding_audio_copy() {
+        // Web bakes audio settings into the encoder fragment; the default
+        // `-c:a copy` for other modes must NOT also be emitted, or the
+        // copy would override the per-codec choice.
+        let cmd = build_ffmpeg_command(
+            Path::new("/in/a.mkv"),
+            Path::new("/out/a.web.mp4"),
+            &opts_web(),
+        );
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(args.windows(2).any(|w| w == ["-ac", "2"]));
+        assert!(args.windows(2).any(|w| w == ["-b:a", "192k"]));
+        assert!(!args.windows(2).any(|w| w == ["-c:a", "copy"]));
+    }
+
+    #[test]
+    fn web_profile_emits_movflags_faststart() {
+        let cmd = build_ffmpeg_command(
+            Path::new("/in/a.mkv"),
+            Path::new("/out/a.web.mp4"),
+            &opts_web(),
+        );
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-movflags", "+faststart"]));
+    }
+
+    #[test]
+    fn web_profile_uses_mp4_mapping_and_mov_text_subs() {
+        // Web is always MP4-on-output regardless of `opts.container`. That
+        // means selective stream mapping plus mov_text for subtitles. Even
+        // if a test leaves `container: Mkv`, Web should override.
+        let mut opts = opts_web();
+        opts.container = Container::Mkv;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.web.mp4"), &opts);
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-map", "0:v"]));
+        assert!(args.windows(2).any(|w| w == ["-map", "0:a?"]));
+        assert!(args.windows(2).any(|w| w == ["-map", "0:s?"]));
+        assert!(!args.windows(2).any(|w| w == ["-map", "0"]));
+        assert!(args.windows(2).any(|w| w == ["-c:s", "mov_text"]));
+    }
+
+    #[test]
+    fn web_profile_suppresses_backend_preamble() {
+        // Web is CPU libx264 only; any backend preamble from the user's
+        // previously-selected hardware backend must not leak into the
+        // ffmpeg command line.
+        let mut opts = opts_web();
+        opts.backend = Backend::Vaapi;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.web.mp4"), &opts);
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-vaapi_device"));
+        assert!(!args.iter().any(|a| a == "-hwaccel"));
+        // And no VAAPI hwupload either.
+        assert!(!args.iter().any(|a| a.contains("hwupload")));
+    }
+
+    #[test]
+    fn web_profile_suppresses_upscale_filter() {
+        // Web has its own fixed pixel pipeline; the configured `upscale`
+        // field must not produce a `-vf` argument.
+        let mut opts = opts_web();
+        opts.upscale = Upscale::To1080p;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.web.mp4"), &opts);
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-vf"));
+    }
+
+    #[test]
+    fn web_profile_keeps_sidecar_subtitle_inputs() {
+        // Sidecar SRTs still get muxed in (as mov_text) when --embed-subtitles
+        // or --merge-subtitles was passed for a Standard run that the user
+        // then re-ran as Web. The web profile uses MP4 mapping, so subs land
+        // as mov_text. Language metadata still gets emitted.
+        let subs = [SubtitleInput {
+            path: PathBuf::from("/in/a.en.srt"),
+            language: Some("en".into()),
+        }];
+        let mut opts = opts_web();
+        opts.subtitles = &subs;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.web.mp4"), &opts);
+        let args = args_of(&cmd);
+        let inputs: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.as_str() == "-i" && *i + 1 < args.len())
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1], "file:/in/a.en.srt");
+        assert!(args.windows(2).any(|w| w == ["-map", "1"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-metadata:s:s:0", "language=en"])
+        );
+    }
+
+    fn opts_hls() -> EncodeOptions<'static> {
+        let mut opts = opts_software_x265();
+        opts.profile = EncodingProfile::Hls;
+        opts
+    }
+
+    #[test]
+    fn hls_profile_uses_filter_complex_splitting_to_three_renditions() {
+        let cmd =
+            build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts_hls());
+        let args = args_of(&cmd);
+        let idx = args
+            .iter()
+            .position(|a| a == "-filter_complex")
+            .expect("has -filter_complex");
+        let filter = &args[idx + 1];
+        // One split that fans out to three branches, each tagged for later
+        // `-map "[vNNNp]"` lookups.
+        assert!(filter.contains("split=3"));
+        assert!(filter.contains("[v360p]"));
+        assert!(filter.contains("[v720p]"));
+        assert!(filter.contains("[v1080p]"));
+        assert!(filter.contains("scale=-2:360"));
+        assert!(filter.contains("scale=-2:720"));
+        assert!(filter.contains("scale=-2:1080"));
+    }
+
+    #[test]
+    fn hls_profile_emits_per_variant_libx264_blocks_in_ladder_order() {
+        let cmd =
+            build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts_hls());
+        let args = args_of(&cmd);
+        // Three video output streams in order.
+        assert!(args.windows(2).any(|w| w == ["-c:v:0", "libx264"]));
+        assert!(args.windows(2).any(|w| w == ["-c:v:1", "libx264"]));
+        assert!(args.windows(2).any(|w| w == ["-c:v:2", "libx264"]));
+        // Bitrate ladder steps from the profile module.
+        assert!(args.windows(2).any(|w| w == ["-b:v:0", "800k"]));
+        assert!(args.windows(2).any(|w| w == ["-b:v:1", "2800k"]));
+        assert!(args.windows(2).any(|w| w == ["-b:v:2", "5000k"]));
+        // Profile / level escalates with bitrate so the master playlist
+        // can advertise the right CODECS hints.
+        assert!(args.windows(2).any(|w| w == ["-profile:v:0", "main"]));
+        assert!(args.windows(2).any(|w| w == ["-profile:v:2", "high"]));
+        assert!(args.windows(2).any(|w| w == ["-level:v:0", "3.0"]));
+        assert!(args.windows(2).any(|w| w == ["-level:v:2", "4.0"]));
+    }
+
+    #[test]
+    fn hls_profile_emits_aac_stereo_per_variant() {
+        let cmd =
+            build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts_hls());
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-c:a:0", "aac"]));
+        assert!(args.windows(2).any(|w| w == ["-c:a:1", "aac"]));
+        assert!(args.windows(2).any(|w| w == ["-c:a:2", "aac"]));
+        assert!(args.windows(2).any(|w| w == ["-ac:a:0", "2"]));
+        assert!(args.windows(2).any(|w| w == ["-b:a:0", "96k"]));
+        assert!(args.windows(2).any(|w| w == ["-b:a:1", "128k"]));
+    }
+
+    #[test]
+    fn hls_profile_forces_keyframes_on_segment_boundary_per_variant() {
+        // Without forced keyframes ffmpeg picks its own GOP boundaries
+        // and segments end up varying length / not starting on I-frames.
+        let cmd =
+            build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts_hls());
+        let args = args_of(&cmd);
+        let want = "expr:gte(t,n_forced*6)";
+        for i in 0..3 {
+            let key = format!("-force_key_frames:v:{i}");
+            assert!(
+                args.windows(2).any(|w| w[0] == key && w[1] == want),
+                "missing {key} {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn hls_profile_emits_var_stream_map_naming_360p_720p_1080p() {
+        let cmd =
+            build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts_hls());
+        let args = args_of(&cmd);
+        let idx = args
+            .iter()
+            .position(|a| a == "-var_stream_map")
+            .expect("has -var_stream_map");
+        assert_eq!(
+            args[idx + 1],
+            "v:0,a:0,name:360p v:1,a:1,name:720p v:2,a:2,name:1080p"
+        );
+    }
+
+    #[test]
+    fn hls_profile_segment_and_playlist_templates_live_under_output_dir() {
+        let cmd = build_ffmpeg_command(
+            Path::new("/in/a.mkv"),
+            Path::new("/out/Show.S01E01.hls"),
+            &opts_hls(),
+        );
+        let args = args_of(&cmd);
+        let seg_idx = args
+            .iter()
+            .position(|a| a == "-hls_segment_filename")
+            .expect("has -hls_segment_filename");
+        assert_eq!(args[seg_idx + 1], "/out/Show.S01E01.hls/%v/segment_%03d.ts");
+        // Final positional arg is the variant playlist template.
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/out/Show.S01E01.hls/%v/playlist.m3u8")
+        );
+    }
+
+    #[test]
+    fn hls_profile_requests_vod_master_playlist_and_mpegts_segments() {
+        let cmd =
+            build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts_hls());
+        let args = args_of(&cmd);
+        assert!(args.windows(2).any(|w| w == ["-f", "hls"]));
+        assert!(args.windows(2).any(|w| w == ["-hls_playlist_type", "vod"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-hls_segment_type", "mpegts"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-master_pl_name", "master.m3u8"])
+        );
+        // independent_segments is what lets the player switch renditions
+        // without buffering across a GOP.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-hls_flags", "independent_segments"])
+        );
+    }
+
+    #[test]
+    fn hls_profile_ignores_backend_preamble_and_upscale_filter() {
+        // Like Web, HLS is its own CPU x264 pipeline and must suppress any
+        // backend hwaccel preamble or `Upscale` `-vf` from leaking through.
+        let mut opts = opts_hls();
+        opts.backend = Backend::Vaapi;
+        opts.upscale = Upscale::To1080p;
+        let cmd = build_ffmpeg_command(Path::new("/in/a.mkv"), Path::new("/out/a.hls"), &opts);
+        let args = args_of(&cmd);
+        assert!(!args.iter().any(|a| a == "-vaapi_device"));
+        assert!(!args.iter().any(|a| a == "-hwaccel"));
+        assert!(!args.iter().any(|a| a == "-vf"));
     }
 }

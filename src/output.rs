@@ -42,6 +42,59 @@ pub fn default_output(source: &Path, container: Container) -> PathBuf {
     }
 }
 
+/// Web-friendly sibling path: `<input-dir>/<input-stem>.web.mp4`.
+///
+/// The source's final extension is dropped and `.web.mp4` is appended to
+/// `file_stem()`, so `Game.of.Thrones.S01E01.Winter.is.Coming.mkv` becomes
+/// `Game.of.Thrones.S01E01.Winter.is.Coming.web.mp4` — intermediate dots in
+/// the stem are preserved verbatim because the streaming-service resolver
+/// matches the source's exact basename plus a `.web.mp4` suffix.
+///
+/// Inputs without a file stem (e.g. `/`, `.`) fall back to `web.mp4` in the
+/// input's parent directory if there is one, else in the current
+/// directory. Inputs without a parent (e.g. a bare filename) place the
+/// sibling in the current directory.
+pub fn web_output_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let file_name = if stem.is_empty() {
+        "web.mp4".to_string()
+    } else {
+        format!("{stem}.web.mp4")
+    };
+    match input.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(file_name),
+        _ => PathBuf::from(file_name),
+    }
+}
+
+/// HLS-bundle output path: `<input-dir>/<input-stem>.hls/` (directory).
+///
+/// Same naming rule as [`web_output_path`] — the source's final extension
+/// is stripped and `.hls` is appended to `file_stem()`, so
+/// `Show.S01E01.1080p.mkv` becomes the directory
+/// `Show.S01E01.1080p.hls/`. The bundle that goes inside (the
+/// `master.m3u8`, the 360p/720p/1080p variant subdirs and their segments)
+/// is laid out by the ffmpeg invocation in `convert.rs` and the
+/// directory prep in `spawn_encode`.
+pub fn hls_output_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir_name = if stem.is_empty() {
+        "hls".to_string()
+    } else {
+        format!("{stem}.hls")
+    };
+    match input.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(dir_name),
+        _ => PathBuf::from(dir_name),
+    }
+}
+
 /// Result of validating an output directory: any non-fatal warnings the user
 /// should see. Fatal problems are returned via `Err` from `validate_output`.
 #[derive(Debug, Default)]
@@ -267,6 +320,88 @@ mod tests {
         fs::write(&b, vec![0u8; 50]).unwrap();
         let total = sum_file_sizes(&[a, b]);
         assert_eq!(total, 150);
+    }
+
+    #[test]
+    fn web_output_path_swaps_extension_with_dot_web_mp4() {
+        let out = web_output_path(Path::new("/tv/Show/S01/episode.mkv"));
+        assert_eq!(out, PathBuf::from("/tv/Show/S01/episode.web.mp4"));
+    }
+
+    #[test]
+    fn web_output_path_works_for_mp4_avi_and_other_sources() {
+        assert_eq!(
+            web_output_path(Path::new("/tv/a.mp4")),
+            PathBuf::from("/tv/a.web.mp4")
+        );
+        assert_eq!(
+            web_output_path(Path::new("/tv/a.avi")),
+            PathBuf::from("/tv/a.web.mp4")
+        );
+        assert_eq!(
+            web_output_path(Path::new("/tv/a.mov")),
+            PathBuf::from("/tv/a.web.mp4")
+        );
+    }
+
+    #[test]
+    fn web_output_path_preserves_dotted_basenames() {
+        // Real-world media filenames are riddled with dots
+        // (release group, year, codec tags). Only the final extension is
+        // stripped — the streaming service resolver matches the entire
+        // dotted stem.
+        let out = web_output_path(Path::new(
+            "/tv/Game.of.Thrones.S01E01.Winter.is.Coming.1080p.x265.mkv",
+        ));
+        assert_eq!(
+            out,
+            PathBuf::from("/tv/Game.of.Thrones.S01E01.Winter.is.Coming.1080p.x265.web.mp4")
+        );
+    }
+
+    #[test]
+    fn web_output_path_keeps_sibling_directory() {
+        // The sibling must land in the source's directory, never under a
+        // separate output root. The streaming resolver only looks at the
+        // source's directory.
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("Show").join("S01");
+        fs::create_dir_all(&nested).unwrap();
+        let src = nested.join("episode.mkv");
+        fs::write(&src, b"").unwrap();
+
+        let out = web_output_path(&src);
+        assert_eq!(out.parent().unwrap(), nested);
+        assert_eq!(out.file_name().unwrap(), "episode.web.mp4");
+    }
+
+    #[test]
+    fn web_output_path_falls_back_to_current_dir_for_bare_filename() {
+        let out = web_output_path(Path::new("episode.mkv"));
+        assert_eq!(out, PathBuf::from("episode.web.mp4"));
+    }
+
+    #[test]
+    fn hls_output_path_creates_dot_hls_sibling_directory() {
+        let out = hls_output_path(Path::new("/tv/Show/S01/episode.mkv"));
+        assert_eq!(out, PathBuf::from("/tv/Show/S01/episode.hls"));
+    }
+
+    #[test]
+    fn hls_output_path_preserves_dotted_basenames() {
+        let out = hls_output_path(Path::new(
+            "/tv/Game.of.Thrones.S01E01.Winter.is.Coming.1080p.x265.mkv",
+        ));
+        assert_eq!(
+            out,
+            PathBuf::from("/tv/Game.of.Thrones.S01E01.Winter.is.Coming.1080p.x265.hls")
+        );
+    }
+
+    #[test]
+    fn hls_output_path_falls_back_to_current_dir_for_bare_filename() {
+        let out = hls_output_path(Path::new("episode.mkv"));
+        assert_eq!(out, PathBuf::from("episode.hls"));
     }
 
     #[test]

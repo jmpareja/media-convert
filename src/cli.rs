@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use media_convert::backend::Backend;
 use media_convert::codec::Codec;
 use media_convert::container::Container;
+use media_convert::profile::EncodingProfile;
 use media_convert::upscale::Upscale;
 
 #[derive(Parser, Debug)]
@@ -18,6 +19,15 @@ pub struct Cli {
     /// sibling of the source directory named "<source>-converted".
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+
+    /// Encoding profile. `standard` (default) honours the
+    /// codec/backend/container/quality/preset/upscale flags below.
+    /// `web` produces a browser-friendly sibling `<stem>.web.mp4` next to
+    /// each source file (H.264 high@4.0 / AAC stereo 192k / MP4 +faststart)
+    /// — it ignores --codec, --backend, --container, --quality, --preset,
+    /// --upscale, and --output, and is incompatible with --merge-subtitles.
+    #[arg(long, value_enum, default_value_t = EncodingProfile::Standard)]
+    pub profile: EncodingProfile,
 
     /// Target video codec
     #[arg(short, long, value_enum, default_value_t = Codec::X265)]
